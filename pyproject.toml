@@ -1,3 +1,8 @@
+[project.urls]
+Homepage = "https://github.com/blepabyte/maxray"
+Repository = "https://github.com/blepabyte/maxray"
+"Issue Tracker" = "https://github.com/blepabyte/maxray/issues"
+
 [tool.poetry]
 name = "maxray"
 version = "0.1.0"
