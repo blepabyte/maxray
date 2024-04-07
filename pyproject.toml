@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "maxray"
+version = "0.1.0"
+description = ""
+authors = ["blepabyte <255@blepabyte.me>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+result = "^0.16.1"
+loguru = "^0.7.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
