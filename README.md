@@ -2,7 +2,7 @@
 
 > the problem with doing weird metaprogramming shit is having to deal with *other people's weird metaprogramming shit*
 
-A tool that allows you to trace and modify the result of (almost) every single expression executed in a Python program.
+Trace and modify the result of (almost) every single expression executed in a Python program. WIP.
 
 ```python
 from maxray import transform, xray, maxray
@@ -39,5 +39,3 @@ show_multiply(
 The `*xray` decorators will recursively trace and patch every single callable they encounter until reaching either builtins, native, or generated code.
 
 The `ctx` argument contains context information about the location of the original source code, which may be useful to build editor/LSP integrations.
-
-WIP.
