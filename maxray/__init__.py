@@ -47,8 +47,10 @@ class W_erHook:
     impl_fn: Callable
     active_call_state: ContextVar[bool]
     writer_active_call_state: ContextVar[bool]
-    skip_modules: set
-    only_modules: set
+
+    descend_predicate: Callable
+    "Determines whether to descend into the source code of callables in the given function context."
+
     mutable: bool
 
     # each walker defines names to skip and we skip recursive transform if *any* walker asks to skip
@@ -76,57 +78,61 @@ def _maxray_walker_handler(x, ctx):
 
     # 1. logic to recursively patch callables
     if callable_allowed_for_transform(x, ctx):
+        # TODO: don't cache objects w/ __call__
         if x in _MAXRAY_FN_CACHE:
-            return _MAXRAY_FN_CACHE[x]
+            x = _MAXRAY_FN_CACHE[x]
+        elif not any(
+            hook.active_call_state.get() and hook.descend_predicate(x, ctx)
+            for hook in _MAXRAY_REGISTERED_HOOKS
+        ):
+            # user-defined filters for which nodes to descend into
+            pass
+        else:
+            match recompile_fn_with_transform(x, _maxray_walker_handler):
+                case Ok(x_trans):
+                    # NOTE: x_trans now has _MAXRAY_TRANSFORMED field to True
+                    if inspect.ismethod(x):
+                        # Two cases: descriptor vs bound method
+                        # TODO: handle callables and .__call__ patching
+                        match x.__self__:
+                            case type():
+                                # Descriptor
+                                logger.warning(
+                                    f"monkey-patching descriptor method {x.__name__} on type {x.__self__}"
+                                )
+                                parent_cls = x.__self__
+                            case _:
+                                # Bound method
+                                logger.warning(
+                                    f"monkey-patching bound method {x.__name__} on type {type(x.__self__)}"
+                                )
+                                parent_cls = type(x.__self__)
 
-        # Our recompiled fn sets and unsets a contextvar whenever it is active
-        match recompile_fn_with_transform(x, _maxray_walker_handler):
-            case Ok(x_trans):
-                # NOTE: x_trans now has _MAXRAY_TRANSFORMED field to True
-                if inspect.ismethod(x):
-                    # Two cases: descriptor vs bound method
-                    # TODO: handle callables and .__call__ patching
-                    match x.__self__:
-                        case type():
-                            # Descriptor
-                            logger.warning(
-                                f"monkey-patching descriptor method {x.__name__} on type {x.__self__}"
-                            )
-                            parent_cls = x.__self__
-                        case _:
-                            # Bound method
-                            logger.warning(
-                                f"monkey-patching bound method {x.__name__} on type {type(x.__self__)}"
-                            )
-                            parent_cls = type(x.__self__)
+                        # Monkey-patching the methods. Probably unsafe and unsound
+                        setattr(parent_cls, x.__name__, x_trans)
+                        x_patched = getattr(
+                            x.__self__, x.__name__
+                        )  # getattr turns class descriptors (@classmethod) into bound methods
 
-                    # Monkey-patching the methods. Probably unsafe and unsound
-                    setattr(parent_cls, x.__name__, x_trans)
-                    x_patched = getattr(
-                        x.__self__, x.__name__
-                    )  # getattr turns class descriptors (@classmethod) into bound methods
+                        # We don't bother caching methods as they're monkey-patched
+                        # SOUNDNESS: a package might manually keep references to __init__ around to later call them - but we'd just end up recompiling those as well
+                    else:
+                        x_patched = x_trans
+                        _MAXRAY_FN_CACHE[x] = x_patched
+                    x = x_patched
 
-                    # We don't bother caching methods as they're monkey-patched
-                    # SOUNDNESS: a package might manually keep references to __init__ around to later call them - but we'd just end up recompiling those as well
-                else:
-                    x_patched = x_trans
-                    _MAXRAY_FN_CACHE[x] = x_patched
-                x = x_patched
-
-            case Err(e):
-                # Cache failures
-                _MAXRAY_FN_CACHE[x] = x
-                # Errors in functions that have been recursively compiled are unimportant
-                logger.trace(f"Failed to transform in walker handler: {e}")
+                case Err(e):
+                    # Cache failures
+                    _MAXRAY_FN_CACHE[x] = x
+                    # Errors in functions that have been recursively compiled are unimportant
+                    logger.trace(f"Failed to transform in walker handler: {e}")
 
     # 2. run the active hooks
     global_write_active_token = _GLOBAL_WRITER_ACTIVE_FLAG.set(True)
     try:
         for walk_hook in _MAXRAY_REGISTERED_HOOKS:
+            # Our recompiled fn sets and unsets a contextvar whenever it is active
             if not walk_hook.active_call_state.get():
-                continue
-
-            if ctx.fn_context.module in walk_hook.skip_modules:
                 continue
 
             # Set the writer active flag
@@ -162,8 +168,7 @@ def maxray(
                 writer,
                 ACTIVE_FLAG,
                 WRITER_ACTIVE_FLAG,
-                skip_modules,
-                set(),
+                lambda x, ctx: ctx.fn_context.module.split(".")[0] not in skip_modules,
                 mutable=mutable,
             )
         )
