@@ -39,3 +39,9 @@ show_multiply(
 The `*xray` decorators will recursively trace and patch every single callable they encounter until reaching either builtins, native, or generated code.
 
 The `ctx` argument contains context information about the location of the original source code, which may be useful to build editor/LSP integrations.
+
+## Installation
+
+```sh
+pip install maxray
+```
