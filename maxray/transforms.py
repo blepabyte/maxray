@@ -58,7 +58,12 @@ class NodeContext:
 
 class FnRewriter(ast.NodeTransformer):
     def __init__(
-        self, transform_fn, fn_context: FnContext, *, instance_type: str | None
+        self,
+        transform_fn,
+        fn_context: FnContext,
+        *,
+        instance_type: str | None,
+        dedent_chars: int = 0,
     ):
         """
         If we're transforming a method, instance type should be the __name__ of the class. Otherwise, None.
@@ -67,6 +72,7 @@ class FnRewriter(ast.NodeTransformer):
         self.transform_fn = transform_fn
         self.fn_context = fn_context
         self.instance_type = instance_type
+        self.dedent_chars = dedent_chars
 
         # the first `def` we encounter is the one that we're transforming. Subsequent ones will be nested/within class definitions.
         self.fn_count = 0
@@ -90,6 +96,12 @@ class FnRewriter(ast.NodeTransformer):
             and identifier_name.strip("_")
         )
 
+    def recover_source(self, pre_node):
+        segment = ast.get_source_segment(self.fn_context.source, pre_node, padded=False)
+        if segment is None:
+            return self.safe_unparse(pre_node)
+        return segment
+
     def build_transform_node(self, node, label, node_source=None):
         """
         Builds the "inspection" node that wraps the original source node - passing the (value, context) pair to `transform_fn`.
@@ -98,7 +110,7 @@ class FnRewriter(ast.NodeTransformer):
             node_source = self.safe_unparse(node)
 
         line_offset = self.fn_context.impl_fn.__code__.co_firstlineno - 2
-        col_offset = 4
+        col_offset = self.dedent_chars
         context_node = ast.Call(
             func=ast.Name(id=NodeContext.__name__, ctx=ast.Load()),
             args=[
@@ -125,6 +137,8 @@ class FnRewriter(ast.NodeTransformer):
         )
 
     def visit_Name(self, node):
+        source_pre = self.recover_source(node)
+
         match node.ctx:
             case ast.Load():
                 # Variable is accessed
@@ -136,14 +150,16 @@ class FnRewriter(ast.NodeTransformer):
                 logger.error(f"Unknown context {node.ctx}")
                 return node
 
-        return self.build_transform_node(new_node, f"name/{node.id}")
+        return self.build_transform_node(
+            new_node, f"name/{node.id}", node_source=source_pre
+        )
 
     def visit_Attribute(self, node: ast.Attribute) -> Any:
         """
         https://docs.python.org/3/reference/expressions.html#atom-identifiers
         > Private name mangling: When an identifier that textually occurs in a class definition begins with two or more underscore characters and does not end in two or more underscores, it is considered a private name of that class. Private names are transformed to a longer form before code is generated for them. The transformation inserts the class name, with leading underscores removed and a single underscore inserted, in front of the name. For example, the identifier __spam occurring in a class named Ham will be transformed to _Ham__spam. This transformation is independent of the syntactical context in which the identifier is used. If the transformed name is extremely long (longer than 255 characters), implementation defined truncation may happen. If the class name consists only of underscores, no transformation is done.
         """
-        source_pre = self.safe_unparse(node)
+        source_pre = self.recover_source(node)
 
         if self.is_method() and self.is_private_class_name(node.attr):
             node.attr = f"_{self.instance_type}{node.attr}"
@@ -164,8 +180,9 @@ class FnRewriter(ast.NodeTransformer):
         return node
 
     def visit_Call(self, node):
+        source_pre = self.recover_source(node)
+
         node_pre = deepcopy(node)
-        source_pre = self.safe_unparse(node_pre)
 
         node = self.generic_visit(node)  # mutates
 
@@ -248,10 +265,13 @@ def recompile_fn_with_transform(
     Recompiles `source_fn` so that essentially every node of its AST tree is wrapped by a call to `transform_fn` with the evaluated value along with context information about the source code.
     """
     try:
-        source = inspect.getsource(source_fn)
+        original_source = inspect.getsource(source_fn)
 
-        # nested functions have excess indentation preventing compile; inspect.cleandoc(source) is an alternative
-        source = dedent(source)
+        # nested functions have excess indentation preventing compile; inspect.cleandoc(source) is an alternative but less reliable
+        source = dedent(original_source)
+
+        # want to map back to correct original location
+        dedent_chars = original_source.find("\n") - source.find("\n")
 
         sourcefile = inspect.getsourcefile(source_fn)
         module = inspect.getmodule(source_fn)
@@ -311,6 +331,7 @@ def recompile_fn_with_transform(
         transform_fn,
         fn_context,
         instance_type=parent_cls.__name__ if fn_is_method else None,
+        dedent_chars=dedent_chars,
     ).visit(fn_ast)
     ast.fix_missing_locations(transformed_fn_ast)
 
@@ -411,6 +432,12 @@ def recompile_fn_with_transform(
         ]
     else:
         transformed_fn = scope[source_fn.__name__]
+
+    # a decorator doesn't actually have to return a function! (could be used solely for side effect) e.g. `@register_backend_lookup_factory` for `find_content_backend` in `awkward/contents/content.py`
+    if not callable(transformed_fn):
+        return Err(
+            f"Resulting transform of definition of {get_fn_name(source_fn)} is not even callable (got {transform_fn}). Perhaps a decorator that returns None?"
+        )
 
     # unmangle the name again - it's possible some packages might use __name__ internally for registries and whatnot
     transformed_fn.__name__ = source_fn.__name__
