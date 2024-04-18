@@ -320,3 +320,22 @@ def test_xray_immutable():
         return x, y
 
     assert foo() == (1, 20.0)
+
+
+def test_walk_callable_side_effects():
+    counter = 0
+
+    def slide(x, ctx):
+        nonlocal counter
+        if callable(x):
+            counter += 1
+
+    @xray(slide)
+    def foo():
+        f = lambda x: x
+        for i in range(10):
+            f(i)
+
+    foo()
+
+    assert counter == 11
