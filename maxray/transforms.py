@@ -172,6 +172,12 @@ class FnRewriter(ast.NodeTransformer):
             )
         return node
 
+    def visit_match_case(self, node: ast.match_case) -> Any:
+        # leave node.pattern unchanged because the rules of match patterns are different from the rest of Python
+        # throws "ValueError: MatchClass cls field can only contain Name or Attribute nodes." in compile because `case _wrap(str()):` doesn't work
+        node.body = [self.generic_visit(child) for child in node.body]
+        return node
+
     def visit_Assign(self, node: ast.Assign) -> Any:
         new_node = self.generic_visit(node)
         assert isinstance(new_node, ast.Assign)
@@ -213,23 +219,63 @@ class FnRewriter(ast.NodeTransformer):
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         pre_node = deepcopy(node)
+        self.fn_count += 1
+
+        # Only overwrite the name of our "target function"
+        if self.fn_count == 1 and self.is_method():
+            node.name = f"{node.name}_{_METHOD_MANGLE_NAME}_{node.name}"
+
+        # TODO: add is_root arg (whether fn has directly been decorated with @*xray)
+
+        # Decorators are evaluated sequentially: decorators applied *before* our one (should?) get ignored while decorators applied *after* work correctly
+        is_transform_root = self.fn_count == 1 and any(
+            isinstance(decor, ast.Call)
+            and isinstance(decor.func, ast.Name)
+            and decor.func.id in {"maxray", "xray", "transform"}
+            for decor in node.decorator_list
+        )
+
+        if is_transform_root:
+            logger.info(
+                f"Wiped decorators at level {self.fn_count} for {self.fn_context.impl_fn}: {node.decorator_list}"
+            )
+            # If we didn't clear, decorators would be applied twice - screwing up routing handling in libraries like `quart`: `@app.post("/generate")`
+            node.decorator_list = []
+
+        # Removes type annotations from the call for safety as they're evaluated at definition-time rather than call-time
+        # This may not be needed now that locals are (usually) captured properly
+        for arg in node.args.args:
+            arg.annotation = None
+
+        out = ast.copy_location(self.generic_visit(node), pre_node)
+        return out
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
+        """
+        Copied directly from FunctionDef
+        TODO: FIX OR REFACTOR
+        """
+
+        pre_node = deepcopy(node)
 
         self.fn_count += 1
         # Only overwrite the name of our "target function"
         if self.fn_count == 1 and self.is_method():
             node.name = f"{node.name}_{_METHOD_MANGLE_NAME}_{node.name}"
 
-        # TODO: we should replace decorators with a dynamic check for not belonging to our own `maxray` module
-        BANNED_DECORATIONS = {"maxray", "xray", "transform"}
-        node.decorator_list = [
-            decor
+        is_transform_root = self.fn_count == 1 and any(
+            isinstance(decor, ast.Call)
+            and isinstance(decor.func, ast.Name)
+            and decor.func.id in {"maxray", "xray", "transform"}
             for decor in node.decorator_list
-            if not (
-                isinstance(decor, ast.Call)
-                and isinstance(decor.func, ast.Name)
-                and decor.func.id in BANNED_DECORATIONS
+        )
+
+        if is_transform_root:
+            logger.debug(
+                f"Wiped decorators at level {self.fn_count} for {self.fn_context.impl_fn}: {node.decorator_list}"
             )
-        ]
+            self.fn_count += 1
+            node.decorator_list = []
 
         # Removes type annotations from the call for safety as they're evaluated at definition-time rather than call-time
         # This may not be needed now that locals are (usually) captured properly
@@ -259,11 +305,20 @@ def get_fn_name(fn):
 
 
 def recompile_fn_with_transform(
-    source_fn, transform_fn, ast_pre_callback=None, ast_post_callback=None
+    source_fn,
+    transform_fn,
+    ast_pre_callback=None,
+    ast_post_callback=None,
+    initial_scope={},
 ) -> Result[Callable, str]:
     """
     Recompiles `source_fn` so that essentially every node of its AST tree is wrapped by a call to `transform_fn` with the evaluated value along with context information about the source code.
     """
+    # handle `functools.wraps`
+    if hasattr(source_fn, "__wrapped__"):
+        # SOUNDNESS: failure when decorators aren't applied at the definition site (will look for the original definition, ignoring any transformations that have been applied before the wrap but after definition)
+        source_fn = source_fn.__wrapped__
+
     try:
         original_source = inspect.getsource(source_fn)
 
@@ -302,7 +357,7 @@ def recompile_fn_with_transform(
         )
 
     match fn_ast:
-        case ast.Module(body=[ast.FunctionDef()]):
+        case ast.Module(body=[ast.FunctionDef() | ast.AsyncFunctionDef()]):
             # Good
             pass
         case _:
@@ -343,6 +398,7 @@ def recompile_fn_with_transform(
         NodeContext.__name__: NodeContext,
         "_MAXRAY_FN_CONTEXT": fn_context,
     }
+    scope.update(initial_scope)
 
     # Add class-private names to scope (though only should be usable as a default argument)
     # TODO: should apply to all definitions within a class scope - so @staticmethod descriptors as well...

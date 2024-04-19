@@ -68,7 +68,13 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
     module_path = ctx.fn_context.module.split(".")
     if module_path[0] in _GLOBAL_SKIP_MODULES:
         return False
-    return not hasattr(x, "_MAXRAY_TRANSFORMED") and callable(x)
+    # TODO: deal with nonhashable objects and callables and other exotic types properly
+    return (
+        not hasattr(x, "_MAXRAY_TRANSFORMED")
+        and callable(x)
+        and callable(getattr(x, "__hash__", None))
+        and getattr(x, "__module__", None) not in {"ctypes"}
+    )
 
 
 def _maxray_walker_handler(x, ctx):
@@ -162,6 +168,19 @@ def maxray(
     ACTIVE_FLAG = ContextVar(f"maxray_active for <{writer}>", default=False)
     WRITER_ACTIVE_FLAG = ContextVar(f"writer_active for <{writer}>", default=False)
 
+    # Resolves decorators in the local scope that aren't "closure"-d over
+    # frame = inspect.currentframe()
+    # try:
+    #     caller_locals = frame.f_back.f_locals
+    # except Exception as e:
+    #     logger.exception(e)
+    #     logger.error("Couldn't get locals")
+    #     caller_locals = {}
+    # finally:
+    #     del frame
+
+    caller_locals = {}
+
     def recursive_transform(fn):
         _MAXRAY_REGISTERED_HOOKS.append(
             W_erHook(
@@ -177,7 +196,9 @@ def maxray(
         if hasattr(fn, "_MAXRAY_TRANSFORMED"):
             fn_transform = fn
         else:
-            match recompile_fn_with_transform(fn, _maxray_walker_handler):
+            match recompile_fn_with_transform(
+                fn, _maxray_walker_handler, initial_scope=caller_locals
+            ):
                 case Ok(fn_transform):
                     pass
                 case Err(err):
@@ -186,17 +207,32 @@ def maxray(
                     return fn
 
         # BUG: We can't do @wraps if it's a callable instance, right?
-        @wraps(fn)
-        def fn_with_context_update(*args, **kwargs):
-            # already active on stack
-            if ACTIVE_FLAG.get():
-                return fn_transform(*args, **kwargs)
+        if inspect.iscoroutinefunction(fn):
 
-            ACTIVE_FLAG.set(True)
-            try:
-                return fn_transform(*args, **kwargs)
-            finally:
-                ACTIVE_FLAG.set(False)
+            @wraps(fn)
+            async def fn_with_context_update(*args, **kwargs):
+                # already active on stack
+                if ACTIVE_FLAG.get():
+                    return await fn_transform(*args, **kwargs)
+
+                ACTIVE_FLAG.set(True)
+                try:
+                    return await fn_transform(*args, **kwargs)
+                finally:
+                    ACTIVE_FLAG.set(False)
+        else:
+
+            @wraps(fn)
+            def fn_with_context_update(*args, **kwargs):
+                # already active on stack
+                if ACTIVE_FLAG.get():
+                    return fn_transform(*args, **kwargs)
+
+                ACTIVE_FLAG.set(True)
+                try:
+                    return fn_transform(*args, **kwargs)
+                finally:
+                    ACTIVE_FLAG.set(False)
 
         fn_with_context_update._MAXRAY_TRANSFORMED = True
         return fn_with_context_update

@@ -42,6 +42,10 @@ The `ctx` argument contains context information about the location of the origin
 
 ## Installation
 
+Actively supported Python versions:
+- 3.11
+- 3.12
+
 ```sh
 pip install maxray
 ```
