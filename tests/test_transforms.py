@@ -130,19 +130,19 @@ def test_inspect_signature():
 @contextmanager
 def oop():
     try:
-        yield "foo"
+        yield 2
     finally:
         pass
 
 
 def test_contextmanager():
-    @xray(dbg)
+    @maxray(lambda x, ctx: x * 2 if isinstance(x, int) else x)
     def f():
         with oop() as x:
             pass
         return x
 
-    assert f() == "foo"
+    assert f() == 4
 
 
 def test_property_access():
@@ -339,3 +339,64 @@ def test_walk_callable_side_effects():
     foo()
 
     assert counter == 11
+
+
+def test_match():
+    @maxray(lambda x, ctx: x * 2 if isinstance(x, str) else x)
+    def matcher(x):
+        match x:
+            case int():
+                return str(x)
+            case str() as y:
+                return y
+            case {"aaa": {"bbb": ccc}}:
+                return ccc
+
+    assert matcher(1) == "11"
+    assert matcher("foo") == "foofoofoofoo"
+
+
+def test_multi_decorators():
+    decor_count = []
+
+    def dec(f):
+        decor_count.append(1)
+        return f
+
+    # External decorator applied first: is executed (side effects) but is ignored/wiped and does not affect the generated function at all
+    @maxray(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @dec
+    def f(x):
+        return x
+
+    assert f(2) == 3
+    assert len(decor_count) == 1
+
+    # Works properly when applied last: is wiped for the transform, but is subsequently applied properly to the transformed function
+    @dec
+    @maxray(lambda x, ctx: x - 1 if isinstance(x, int) else x)
+    def f(x):
+        return x
+
+    assert f(2) == 1
+    assert len(decor_count) == 2
+
+
+def test_unhashable_callable():
+    class X:
+        def __call__(self):
+            return 1
+
+    X.__hash__ = None
+
+    @maxray(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    def uh():
+        z = X()
+        return z()
+
+    assert uh() == 2
+
+
+def test_wrap_unsound():
+    # TODO
+    pass
