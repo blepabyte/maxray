@@ -1,6 +1,7 @@
 name: Publish package
 
-# on: [push]
+on:
+  workflow_dispatch:
 
 jobs:
   publish:
@@ -16,5 +17,7 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           pypi-token: ${{ secrets.PYPI_TOKEN }}
+          main-branch: master
+          python-version: 3.11
     outputs:
       released: ${{ steps.release.outputs.released }}
