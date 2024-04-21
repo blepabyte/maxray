@@ -1,0 +1,20 @@
+name: Publish package
+
+# on: [push]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    concurrency: publish
+    permissions: write-all
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: matteo4diani/poetry-semantic-release@main
+        name: Semantic Release
+        id: release
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pypi-token: ${{ secrets.PYPI_TOKEN }}
+    outputs:
+      released: ${{ steps.release.outputs.released }}
