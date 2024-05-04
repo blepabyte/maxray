@@ -2,6 +2,13 @@
 
 
 
+## v0.1.1 (2024-05-04)
+
+### Fix
+
+* fix: ctypes module check ([`883ee4f`](https://github.com/blepabyte/maxray/commit/883ee4fb93fefa5429cd22ff66ea4de36caa3227))
+
+
 ## v0.1.0 (2024-04-21)
 
 ### Chore

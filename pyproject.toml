@@ -5,7 +5,7 @@ Repository = "https://github.com/blepabyte/maxray"
 
 [tool.poetry]
 name = "maxray"
-version = "0.1.0"
+version = "0.1.1"
 description = ""
 authors = ["blepabyte <255@blepabyte.me>"]
 readme = "README.md"
