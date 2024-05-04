@@ -73,7 +73,7 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
         not hasattr(x, "_MAXRAY_TRANSFORMED")
         and callable(x)
         and callable(getattr(x, "__hash__", None))
-        and getattr(x, "__module__", None) not in {"ctypes"}
+        and getattr(type(x), "__module__", None) not in {"ctypes"}
     )
 
 
