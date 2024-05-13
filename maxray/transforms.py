@@ -89,6 +89,10 @@ class FnRewriter(ast.NodeTransformer):
             return "<UNUNPARSEABLE>"
 
     @staticmethod
+    def safe_show_ast(node):
+        return ast.dump(node, indent=4)
+
+    @staticmethod
     def is_private_class_name(identifier_name: str):
         return (
             identifier_name.startswith("__")
@@ -243,9 +247,14 @@ class FnRewriter(ast.NodeTransformer):
             node.decorator_list = []
 
         # Removes type annotations from the call for safety as they're evaluated at definition-time rather than call-time
-        # This may not be needed now that locals are (usually) captured properly
+        # Necessary because some packages do `if typing.TYPE_CHECKING` imports
         for arg in node.args.args:
             arg.annotation = None
+
+        for arg in node.args.kwonlyargs:
+            arg.annotation = None
+
+        node.returns = None
 
         out = ast.copy_location(self.generic_visit(node), pre_node)
         return out
@@ -452,6 +461,11 @@ def recompile_fn_with_transform(
         logger.error(
             f"Failed to compile function {source_fn.__name__} in its module {module}"
         )
+        logger.debug(f"Relevant original source code:\n{source}")
+        logger.debug(f"Corresponding AST:\n{FnRewriter.safe_show_ast(fn_ast)}")
+        logger.debug(
+            f"Transformed code we attempted to compile:\n{FnRewriter.safe_unparse(transformed_fn_ast)}"
+        )
 
         # FALLBACK: in numpy.core.numeric, they define `@set_module` that rewrites __module__ so inspect gives us the wrong module to correctly re-execute the def in
         # sourcefile is still correct so let's try use `sys.modules`
@@ -470,7 +484,6 @@ def recompile_fn_with_transform(
                     ),
                     scope,
                     scope,
-                    # closure=fn.__closure__,
                 )
             except Exception as e:
                 logger.exception(e)

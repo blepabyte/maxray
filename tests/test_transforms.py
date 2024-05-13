@@ -6,8 +6,15 @@ from dataclasses import dataclass
 import functools
 
 
+def increment_ints_by_one(x, ctx):
+    if isinstance(x, int):
+        return x + 1
+    else:
+        return x
+
+
 def test_basic():
-    @transform(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @transform(increment_ints_by_one)
     def f(x):
         return x
 
@@ -17,7 +24,7 @@ def test_basic():
 def test_type_hints():
     from typing import Any
 
-    @transform(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @transform(increment_ints_by_one)
     def f(x: Any):
         return x
 
@@ -27,7 +34,7 @@ def test_type_hints():
 def test_closure_capture():
     z = 1
 
-    @transform(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @transform(increment_ints_by_one)
     def f(x):
         return x + z
 
@@ -37,7 +44,7 @@ def test_closure_capture():
 def test_closure_capture_mutate():
     z = []
 
-    @transform(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @transform(increment_ints_by_one)
     def f(x):
         z.append(x)
 
@@ -50,7 +57,7 @@ GLOB_CONST = 5
 
 
 def test_global_capture():
-    @transform(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @transform(increment_ints_by_one)
     def g(x):
         return x + GLOB_CONST
 
@@ -61,7 +68,7 @@ def test_nested_def():
     def outer():
         z = []
 
-        @transform(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+        @transform(increment_ints_by_one)
         def g(x):
             z.append(x)
             return x
@@ -153,7 +160,7 @@ def test_property_access():
 
     obj = A(1, 2.3)
 
-    @maxray(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @maxray(increment_ints_by_one)
     def g():
         return obj.x
 
@@ -312,7 +319,7 @@ def test_double_decorators_with_locals():
 
 def test_xray_immutable():
     @maxray(lambda x, ctx: x * 10 if isinstance(x, float) else x)
-    @xray(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @xray(increment_ints_by_one)
     def foo():
         # Currently assumes that literals/constants are not wrapped (they're uninteresting anyways)
         x = 1
@@ -364,7 +371,7 @@ def test_multi_decorators():
         return f
 
     # External decorator applied first: is executed (side effects) but is ignored/wiped and does not affect the generated function at all
-    @maxray(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @maxray(increment_ints_by_one)
     @dec
     def f(x):
         return x
@@ -389,12 +396,23 @@ def test_unhashable_callable():
 
     X.__hash__ = None
 
-    @maxray(lambda x, ctx: x + 1 if isinstance(x, int) else x)
+    @maxray(increment_ints_by_one)
     def uh():
         z = X()
         return z()
 
     assert uh() == 2
+
+
+def test_junk_annotations():
+    @maxray(increment_ints_by_one)
+    def outer():
+        def inner(x: ASDF = 0, *, y: SDFSDF = 100) -> AAAAAAAAAAA:
+            return x + y
+
+        return inner(2)
+
+    assert outer() == 105
 
 
 def test_wrap_unsound():
