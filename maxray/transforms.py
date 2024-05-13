@@ -7,6 +7,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from copy import deepcopy
 from result import Result, Ok, Err
+from contextvars import ContextVar
+from functools import wraps
 
 from typing import Any, Callable
 
@@ -31,7 +33,10 @@ class FnContext:
     module: str
     source: str
     source_file: str
-    # TODO: add location as well
+    call_count: ContextVar[int]
+
+    def __repr__(self):
+        return f"{self.module}/{self.name}/{self.call_count.get()}"
 
 
 @dataclass
@@ -53,7 +58,7 @@ class NodeContext:
     location: tuple[int, int, int, int]
 
     def __repr__(self):
-        return f"{self.fn_context.module}/{self.fn_context.name}/{self.id}"
+        return f"{self.fn_context}/{self.id}"
 
 
 class FnRewriter(ast.NodeTransformer):
@@ -64,6 +69,7 @@ class FnRewriter(ast.NodeTransformer):
         *,
         instance_type: str | None,
         dedent_chars: int = 0,
+        record_call_counts: bool = True,
     ):
         """
         If we're transforming a method, instance type should be the __name__ of the class. Otherwise, None.
@@ -73,6 +79,7 @@ class FnRewriter(ast.NodeTransformer):
         self.fn_context = fn_context
         self.instance_type = instance_type
         self.dedent_chars = dedent_chars
+        self.record_call_counts = record_call_counts
 
         # the first `def` we encounter is the one that we're transforming. Subsequent ones will be nested/within class definitions.
         self.fn_count = 0
@@ -257,6 +264,18 @@ class FnRewriter(ast.NodeTransformer):
         node.returns = None
 
         out = ast.copy_location(self.generic_visit(node), pre_node)
+
+        # Add statements after visiting so that walk handlers aren't called on this internal code
+        if self.fn_count == 1 and self.record_call_counts:
+            # has to be applied as a decorator so that inner recursive calls of the fn are tracked properly
+            node.decorator_list.append(
+                ast.Call(
+                    func=ast.Name(id="_MAXRAY_DECORATE_WITH_COUNTER", ctx=ast.Load()),
+                    args=[ast.Name(id="_MAXRAY_CALL_COUNTER", ctx=ast.Load())],
+                    keywords=[],
+                )
+            )
+
         return out
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
@@ -388,8 +407,14 @@ def recompile_fn_with_transform(
                 # Bound method
                 parent_cls = type(source_fn.__self__)
 
+    fn_call_counter = ContextVar("maxray_call_counter", default=0)
     fn_context = FnContext(
-        source_fn, source_fn.__name__, module.__name__, source, sourcefile
+        source_fn,
+        source_fn.__name__,
+        module.__name__,
+        source,
+        sourcefile,
+        fn_call_counter,
     )
     transformed_fn_ast = FnRewriter(
         transform_fn,
@@ -406,6 +431,8 @@ def recompile_fn_with_transform(
         transform_fn.__name__: transform_fn,
         NodeContext.__name__: NodeContext,
         "_MAXRAY_FN_CONTEXT": fn_context,
+        "_MAXRAY_CALL_COUNTER": fn_call_counter,
+        "_MAXRAY_DECORATE_WITH_COUNTER": count_calls_with,
     }
     scope.update(initial_scope)
 
@@ -459,7 +486,7 @@ def recompile_fn_with_transform(
     except Exception as e:
         logger.exception(e)
         logger.error(
-            f"Failed to compile function {source_fn.__name__} in its module {module}"
+            f"Failed to compile function `{source_fn.__name__}` at '{sourcefile}' in its module {module}"
         )
         logger.debug(f"Relevant original source code:\n{source}")
         logger.debug(f"Corresponding AST:\n{FnRewriter.safe_show_ast(fn_ast)}")
@@ -515,3 +542,36 @@ def recompile_fn_with_transform(
     transformed_fn._MAXRAY_TRANSFORMED = True
 
     return Ok(transformed_fn)
+
+
+def count_calls_with(counter: ContextVar):
+    def inner(fn):
+        # TODO: synchronisation/context?
+        total_calls_count = 0
+
+        if inspect.iscoroutinefunction(fn):
+
+            @wraps(fn)
+            async def fn_with_counter(*args, **kwargs):
+                nonlocal total_calls_count
+                total_calls_count += 1
+                reset_call = counter.set(total_calls_count)
+                try:
+                    return await fn(*args, **kwargs)
+                finally:
+                    counter.reset(reset_call)
+        else:
+
+            @wraps(fn)
+            def fn_with_counter(*args, **kwargs):
+                nonlocal total_calls_count
+                total_calls_count += 1
+                reset_call = counter.set(total_calls_count)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    counter.reset(reset_call)
+
+        return fn_with_counter
+
+    return inner

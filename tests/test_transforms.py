@@ -1,4 +1,5 @@
 from maxray import transform, xray, maxray
+from maxray.transforms import NodeContext
 from maxray.walkers import dbg
 
 from contextlib import contextmanager
@@ -413,6 +414,44 @@ def test_junk_annotations():
         return inner(2)
 
     assert outer() == 105
+
+
+def test_call_counts():
+    calls = []
+
+    def track_call_counts(x, ctx: NodeContext):
+        calls.append(ctx.fn_context.call_count.get())
+        return x
+
+    @xray(track_call_counts)
+    def f(x):
+        return x
+
+    f(1)
+    f(1)
+    assert set(calls) == {1, 2}
+
+    f(1)
+    assert set(calls) == {1, 2, 3}
+
+
+def test_call_counts_recursive():
+    calls = []
+
+    def track_call_counts(x, ctx: NodeContext):
+        if ctx.id in ["name/f", "call/f(x - 1)"]:
+            calls.append(ctx.fn_context.call_count.get())
+        return x
+
+    @xray(track_call_counts)
+    @xray(dbg)
+    def f(x):
+        if x > 0:
+            return f(x - 1)
+        return 1
+
+    f(3)
+    assert calls == [1, 2, 3, 3, 2, 1]
 
 
 def test_wrap_unsound():

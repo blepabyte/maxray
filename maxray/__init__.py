@@ -77,7 +77,7 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
     )
 
 
-def _maxray_walker_handler(x, ctx):
+def _maxray_walker_handler(x, ctx: NodeContext):
     # We ignore writer calls triggered by code execution in other writers to prevent easily getting stuck in recursive hell
     if _GLOBAL_WRITER_ACTIVE_FLAG.get():
         return x
@@ -179,6 +179,7 @@ def maxray(
     # finally:
     #     del frame
 
+    # TODO: allow configuring injection of variables into exec scope
     caller_locals = {}
 
     def recursive_transform(fn):
@@ -211,28 +212,20 @@ def maxray(
 
             @wraps(fn)
             async def fn_with_context_update(*args, **kwargs):
-                # already active on stack
-                if ACTIVE_FLAG.get():
-                    return await fn_transform(*args, **kwargs)
-
-                ACTIVE_FLAG.set(True)
+                prev_token = ACTIVE_FLAG.set(True)
                 try:
                     return await fn_transform(*args, **kwargs)
                 finally:
-                    ACTIVE_FLAG.set(False)
+                    ACTIVE_FLAG.reset(prev_token)
         else:
 
             @wraps(fn)
             def fn_with_context_update(*args, **kwargs):
-                # already active on stack
-                if ACTIVE_FLAG.get():
-                    return fn_transform(*args, **kwargs)
-
-                ACTIVE_FLAG.set(True)
+                prev_token = ACTIVE_FLAG.set(True)
                 try:
                     return fn_transform(*args, **kwargs)
                 finally:
-                    ACTIVE_FLAG.set(False)
+                    ACTIVE_FLAG.reset(prev_token)
 
         fn_with_context_update._MAXRAY_TRANSFORMED = True
         return fn_with_context_update
