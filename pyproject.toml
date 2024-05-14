@@ -1,14 +1,14 @@
-[project.urls]
-Homepage = "https://github.com/blepabyte/maxray"
-Source = "https://github.com/blepabyte/maxray"
-Tracker = "https://github.com/blepabyte/maxray/issues"
-
 [tool.poetry]
 name = "maxray"
 version = "0.2.0"
 description = ""
 authors = ["blepabyte <255@blepabyte.me>"]
 readme = "README.md"
+
+[tool.poetry.urls]
+Homepage = "https://github.com/blepabyte/maxray"
+Source = "https://github.com/blepabyte/maxray"
+Tracker = "https://github.com/blepabyte/maxray/issues"
 
 [tool.poetry.dependencies]
 python = "^3.11"
