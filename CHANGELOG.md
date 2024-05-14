@@ -2,6 +2,23 @@
 
 
 
+## v0.2.0 (2024-05-14)
+
+### Documentation
+
+* docs: fix project urls ([`e842dfe`](https://github.com/blepabyte/maxray/commit/e842dfe159cc3210c30de43f340fc5bc1ed4a276))
+
+### Feature
+
+* feat: track return nodes, optionally collecting the local scope on exit ([`8afe9ad`](https://github.com/blepabyte/maxray/commit/8afe9adcf9ddd186d9978cd35ba95ab05dbd3b26))
+
+* feat: add counter for n-th function invocation to node context ([`0d51259`](https://github.com/blepabyte/maxray/commit/0d512592858ec20b7c8b05aba63b31413de2f9ce))
+
+### Fix
+
+* fix: remove kwonly and return type annotations ([`f0f66d0`](https://github.com/blepabyte/maxray/commit/f0f66d046f3558aeae6ad6c2510839ad670e3db5))
+
+
 ## v0.1.1 (2024-05-04)
 
 ### Fix
