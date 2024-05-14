@@ -19,7 +19,7 @@ def test_basic():
     def f(x):
         return x
 
-    assert f(3) == 4
+    assert f(3) == 5
 
 
 def test_type_hints():
@@ -29,7 +29,7 @@ def test_type_hints():
     def f(x: Any):
         return x
 
-    assert f(3) == 4
+    assert f(3) == 5
 
 
 def test_closure_capture():
@@ -39,7 +39,7 @@ def test_closure_capture():
     def f(x):
         return x + z
 
-    assert f(3) == 6
+    assert f(3) == 7
 
 
 def test_closure_capture_mutate():
@@ -62,7 +62,7 @@ def test_global_capture():
     def g(x):
         return x + GLOB_CONST
 
-    assert g(3) == 10
+    assert g(3) == 11
 
 
 def test_nested_def():
@@ -76,8 +76,8 @@ def test_nested_def():
 
         return g
 
-    assert outer()(3) == 4
-    assert outer()(3) == 4
+    assert outer()(3) == 5
+    assert outer()(3) == 5
 
 
 def test_recursive():
@@ -150,7 +150,7 @@ def test_contextmanager():
             pass
         return x
 
-    assert f() == 4
+    assert f() == 8
 
 
 def test_property_access():
@@ -165,7 +165,7 @@ def test_property_access():
     def g():
         return obj.x
 
-    assert g() == 2
+    assert g() == 3
 
 
 def test_method():
@@ -377,7 +377,7 @@ def test_multi_decorators():
     def f(x):
         return x
 
-    assert f(2) == 3
+    assert f(2) == 4
     assert len(decor_count) == 1
 
     # Works properly when applied last: is wiped for the transform, but is subsequently applied properly to the transformed function
@@ -386,7 +386,7 @@ def test_multi_decorators():
     def f(x):
         return x
 
-    assert f(2) == 1
+    assert f(2) == 0
     assert len(decor_count) == 2
 
 
@@ -402,7 +402,7 @@ def test_unhashable_callable():
         z = X()
         return z()
 
-    assert uh() == 2
+    assert uh() == 3
 
 
 def test_junk_annotations():
@@ -413,7 +413,7 @@ def test_junk_annotations():
 
         return inner(2)
 
-    assert outer() == 105
+    assert outer() == 107
 
 
 def test_call_counts():
@@ -452,6 +452,35 @@ def test_call_counts_recursive():
 
     f(3)
     assert calls == [1, 2, 3, 3, 2, 1]
+
+
+def test_empty_return():
+    @xray(dbg)
+    def empty_returns():
+        return
+
+    assert empty_returns() is None
+
+
+def test_scope_passed():
+    found_scope = None
+
+    def get_scope(x, ctx):
+        nonlocal found_scope
+        if ctx.local_scope is not None:
+            assert found_scope is None
+            found_scope = ctx.local_scope
+        return x
+
+    @xray(get_scope, pass_scope=True)
+    def f(n):
+        z = 3
+        return n
+
+    assert f(1) == 1
+
+    assert "z" in found_scope
+    assert found_scope["z"] == 3
 
 
 def test_wrap_unsound():

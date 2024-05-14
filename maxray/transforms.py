@@ -36,7 +36,8 @@ class FnContext:
     call_count: ContextVar[int]
 
     def __repr__(self):
-        return f"{self.module}/{self.name}/{self.call_count.get()}"
+        # Call count not included in repr so the same source location can be "grouped by" over multiple calls
+        return f"{self.module}/{self.name}"
 
 
 @dataclass
@@ -57,6 +58,8 @@ class NodeContext:
 
     location: tuple[int, int, int, int]
 
+    local_scope: Any = None
+
     def __repr__(self):
         return f"{self.fn_context}/{self.id}"
 
@@ -70,6 +73,7 @@ class FnRewriter(ast.NodeTransformer):
         instance_type: str | None,
         dedent_chars: int = 0,
         record_call_counts: bool = True,
+        pass_locals_on_return: bool = False,
     ):
         """
         If we're transforming a method, instance type should be the __name__ of the class. Otherwise, None.
@@ -80,6 +84,7 @@ class FnRewriter(ast.NodeTransformer):
         self.instance_type = instance_type
         self.dedent_chars = dedent_chars
         self.record_call_counts = record_call_counts
+        self.pass_locals_on_return = pass_locals_on_return
 
         # the first `def` we encounter is the one that we're transforming. Subsequent ones will be nested/within class definitions.
         self.fn_count = 0
@@ -113,7 +118,7 @@ class FnRewriter(ast.NodeTransformer):
             return self.safe_unparse(pre_node)
         return segment
 
-    def build_transform_node(self, node, label, node_source=None):
+    def build_transform_node(self, node, label, node_source=None, pass_locals=False):
         """
         Builds the "inspection" node that wraps the original source node - passing the (value, context) pair to `transform_fn`.
         """
@@ -122,22 +127,33 @@ class FnRewriter(ast.NodeTransformer):
 
         line_offset = self.fn_context.impl_fn.__code__.co_firstlineno - 2
         col_offset = self.dedent_chars
+
+        context_args = [
+            ast.Constant(label),
+            ast.Constant(node_source),
+            # Name is injected into the exec scope by `recompile_fn_with_transform`
+            ast.Name(id="_MAXRAY_FN_CONTEXT", ctx=ast.Load()),
+            ast.Constant(
+                (
+                    line_offset + node.lineno,
+                    line_offset + node.end_lineno,
+                    node.col_offset + col_offset,
+                    node.end_col_offset + col_offset,
+                )
+            ),
+        ]
+
+        if pass_locals:
+            context_args.append(
+                ast.Call(
+                    func=ast.Name(id="_MAXRAY_BUILTINS_LOCALS", ctx=ast.Load()),
+                    args=[],
+                    keywords=[],
+                ),
+            )
         context_node = ast.Call(
             func=ast.Name(id=NodeContext.__name__, ctx=ast.Load()),
-            args=[
-                ast.Constant(label),
-                ast.Constant(node_source),
-                # Name is injected into the exec scope by `recompile_fn_with_transform`
-                ast.Name(id="_MAXRAY_FN_CONTEXT", ctx=ast.Load()),
-                ast.Constant(
-                    (
-                        line_offset + node.lineno,
-                        line_offset + node.end_lineno,
-                        node.col_offset + col_offset,
-                        node.end_col_offset + col_offset,
-                    )
-                ),
-            ],
+            args=context_args,
             keywords=[],
         )
 
@@ -196,6 +212,28 @@ class FnRewriter(ast.NodeTransformer):
         # node.value = self.build_transform_node(new_node, f"assign/(multiple)")
         return node
 
+    def visit_Return(self, node: ast.Return) -> Any:
+        node_pre = deepcopy(node)
+
+        if node.value is None:
+            node.value = ast.Constant(None)
+
+        # Note: For a plain `return` statement, there's no source for a thing that *isn't* returned
+        value_source_pre = self.recover_source(node.value)
+
+        node = self.generic_visit(node)
+
+        # TODO: Check source locations are correct here
+        ast.fix_missing_locations(node)
+        node.value = self.build_transform_node(
+            node.value,
+            f"return/{value_source_pre}",
+            node_source=value_source_pre,
+            pass_locals=self.pass_locals_on_return,
+        )
+
+        return ast.copy_location(node, node_pre)
+
     def visit_Call(self, node):
         source_pre = self.recover_source(node)
 
@@ -204,14 +242,6 @@ class FnRewriter(ast.NodeTransformer):
         node = self.generic_visit(node)  # mutates
 
         # the function/callable instance itself is observed by Name/Attribute/... nodes
-
-        target = node.func
-        match target:
-            case ast.Name():
-                logger.debug(f"Visiting call to function {target.id}")
-            case ast.Attribute():
-                logger.debug(f"Visiting call to attribute {target.attr}")
-
         return ast.copy_location(
             self.build_transform_node(
                 node, f"call/{source_pre}", node_source=source_pre
@@ -338,6 +368,7 @@ def recompile_fn_with_transform(
     ast_pre_callback=None,
     ast_post_callback=None,
     initial_scope={},
+    pass_scope=False,
 ) -> Result[Callable, str]:
     """
     Recompiles `source_fn` so that essentially every node of its AST tree is wrapped by a call to `transform_fn` with the evaluated value along with context information about the source code.
@@ -421,6 +452,7 @@ def recompile_fn_with_transform(
         fn_context,
         instance_type=parent_cls.__name__ if fn_is_method else None,
         dedent_chars=dedent_chars,
+        pass_locals_on_return=pass_scope,
     ).visit(fn_ast)
     ast.fix_missing_locations(transformed_fn_ast)
 
@@ -433,6 +465,7 @@ def recompile_fn_with_transform(
         "_MAXRAY_FN_CONTEXT": fn_context,
         "_MAXRAY_CALL_COUNTER": fn_call_counter,
         "_MAXRAY_DECORATE_WITH_COUNTER": count_calls_with,
+        "_MAXRAY_BUILTINS_LOCALS": locals,
     }
     scope.update(initial_scope)
 

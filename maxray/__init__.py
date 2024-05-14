@@ -26,11 +26,11 @@ def transform(writer):
     return inner
 
 
-def xray(walker):
+def xray(walker, **kwargs):
     """
     Immutable version of `maxray` - expressions are passed to `walker` but its return value is ignored and the original code execution is left unchanged.
     """
-    return maxray(walker, mutable=False)
+    return maxray(walker, **kwargs, mutable=False)
 
 
 _GLOBAL_SKIP_MODULES = {
@@ -65,6 +65,9 @@ _MAXRAY_FN_CACHE = dict()
 
 
 def callable_allowed_for_transform(x, ctx: NodeContext):
+    if getattr(x, "__module__", None) in _GLOBAL_SKIP_MODULES:
+        return False
+
     module_path = ctx.fn_context.module.split(".")
     if module_path[0] in _GLOBAL_SKIP_MODULES:
         return False
@@ -155,7 +158,11 @@ def _maxray_walker_handler(x, ctx: NodeContext):
 
 
 def maxray(
-    writer: Callable[[Any, NodeContext], Any], skip_modules=frozenset(), *, mutable=True
+    writer: Callable[[Any, NodeContext], Any],
+    skip_modules=frozenset(),
+    *,
+    mutable=True,
+    pass_scope=False,
 ):
     """
     A transform that recursively hooks into all further calls made within the function, so that `writer` will (in theory) observe every single expression evaluated by the Python interpreter occurring as part of the decorated function call.
@@ -198,7 +205,10 @@ def maxray(
             fn_transform = fn
         else:
             match recompile_fn_with_transform(
-                fn, _maxray_walker_handler, initial_scope=caller_locals
+                fn,
+                _maxray_walker_handler,
+                initial_scope=caller_locals,
+                pass_scope=pass_scope,
             ):
                 case Ok(fn_transform):
                     pass
