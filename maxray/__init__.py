@@ -80,12 +80,54 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
     )
 
 
+def instance_init_allowed_for_transform(x, ctx: NodeContext):
+    """
+    Decides whether the __init__ method can be transformed.
+    """
+    return (
+        type(x) is type
+        and hasattr(x, "__init__")
+        and not hasattr(x, "_MAXRAY_TRANSFORMED")
+    )
+
+
+def instance_call_allowed_for_transform(x, ctx: NodeContext):
+    """
+    Decides whether the __call__ method can be transformed.
+    """
+    return (
+        type(x) is type
+        and hasattr(x, "__call__")
+        and not hasattr(x, "_MAXRAY_TRANSFORMED")
+    )
+
+
 def _maxray_walker_handler(x, ctx: NodeContext):
     # We ignore writer calls triggered by code execution in other writers to prevent easily getting stuck in recursive hell
     if _GLOBAL_WRITER_ACTIVE_FLAG.get():
         return x
 
-    # 1. logic to recursively patch callables
+    # 1.  logic to recursively patch callables
+    # 1a. special-case callables: __init__ and __call__
+    if instance_init_allowed_for_transform(x, ctx):
+        # TODO: should we somehow delay doing this until before an actual call?
+        match recompile_fn_with_transform(
+            x.__init__, _maxray_walker_handler, special_use_instance_type=x
+        ):
+            case Ok(init_patch):
+                logger.info(f"Patching __init__ for class {x}")
+                setattr(x, "__init__", init_patch)
+
+    if instance_call_allowed_for_transform(x, ctx):
+        # TODO: should we somehow delay doing this until before an actual call?
+        match recompile_fn_with_transform(
+            x.__call__, _maxray_walker_handler, special_use_instance_type=x
+        ):
+            case Ok(call_patch):
+                logger.info(f"Patching __call__ for class {x}")
+                setattr(x, "__call__", call_patch)
+
+    # 1b. normal functions or bound methods or method descriptors like @classmethod and @staticmethod
     if callable_allowed_for_transform(x, ctx):
         # TODO: don't cache objects w/ __call__
         if x in _MAXRAY_FN_CACHE:
@@ -94,7 +136,7 @@ def _maxray_walker_handler(x, ctx: NodeContext):
             hook.active_call_state.get() and hook.descend_predicate(x, ctx)
             for hook in _MAXRAY_REGISTERED_HOOKS
         ):
-            # user-defined filters for which nodes to descend into
+            # user-defined filters for which nodes (not) to descend into
             pass
         else:
             match recompile_fn_with_transform(x, _maxray_walker_handler):
@@ -102,17 +144,16 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                     # NOTE: x_trans now has _MAXRAY_TRANSFORMED field to True
                     if inspect.ismethod(x):
                         # Two cases: descriptor vs bound method
-                        # TODO: handle callables and .__call__ patching
                         match x.__self__:
                             case type():
                                 # Descriptor
-                                logger.warning(
+                                logger.debug(
                                     f"monkey-patching descriptor method {x.__name__} on type {x.__self__}"
                                 )
                                 parent_cls = x.__self__
                             case _:
                                 # Bound method
-                                logger.warning(
+                                logger.debug(
                                     f"monkey-patching bound method {x.__name__} on type {type(x.__self__)}"
                                 )
                                 parent_cls = type(x.__self__)

@@ -357,7 +357,7 @@ def get_fn_name(fn):
         try:
             name = repr(fn)
         except Exception:
-            name = "<unrepresentable function>"
+            name = f"<unrepresentable function of type {type(fn)}>"
 
     return f"{name} @ {id(fn)}"
 
@@ -369,10 +369,18 @@ def recompile_fn_with_transform(
     ast_post_callback=None,
     initial_scope={},
     pass_scope=False,
+    special_use_instance_type=None,
 ) -> Result[Callable, str]:
     """
     Recompiles `source_fn` so that essentially every node of its AST tree is wrapped by a call to `transform_fn` with the evaluated value along with context information about the source code.
     """
+    # TODO: use non-overridable __getattribute__ instead?
+    if not hasattr(source_fn, "__name__"):  # Safety check against weird functions
+        return Err(f"There is no __name__ for function {get_fn_name(source_fn)}")
+
+    if source_fn.__name__ == "<lambda>":
+        return Err("Cannot safely recompile lambda functions")
+
     # handle `functools.wraps`
     if hasattr(source_fn, "__wrapped__"):
         # SOUNDNESS: failure when decorators aren't applied at the definition site (will look for the original definition, ignoring any transformations that have been applied before the wrap but after definition)
@@ -404,10 +412,8 @@ def recompile_fn_with_transform(
         return Err(
             f"No source code for probable built-in function {get_fn_name(source_fn)}"
         )
-
-    # TODO: use non-overridable __getattribute__ instead?
-    if not hasattr(source_fn, "__name__"):  # Safety check against weird functions
-        return Err(f"There is no __name__ for function {get_fn_name(source_fn)}")
+    except SyntaxError:
+        return Err(f"Syntax error in function {get_fn_name(source_fn)}")
 
     if "super()" in source:
         # TODO: we could replace calls to super() with super(__class__, self)?
@@ -437,6 +443,11 @@ def recompile_fn_with_transform(
             case _:
                 # Bound method
                 parent_cls = type(source_fn.__self__)
+
+    # yeah yeah an unbound __init__ isn't actually a method but we can basically treat it as one
+    if special_use_instance_type is not None:
+        fn_is_method = True
+        parent_cls = special_use_instance_type
 
     fn_call_counter = ContextVar("maxray_call_counter", default=0)
     fn_context = FnContext(

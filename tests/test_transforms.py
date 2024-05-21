@@ -402,7 +402,7 @@ def test_unhashable_callable():
         z = X()
         return z()
 
-    assert uh() == 3
+    assert uh() == 4
 
 
 def test_junk_annotations():
