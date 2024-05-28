@@ -6,6 +6,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import functools
 
+import pytest
+
+from loguru import logger
+
+logger.enable("maxray")
+
 
 def increment_ints_by_one(x, ctx):
     if isinstance(x, int):
@@ -402,7 +408,7 @@ def test_unhashable_callable():
         z = X()
         return z()
 
-    assert uh() == 4
+    assert uh() == 3
 
 
 def test_junk_annotations():
@@ -483,6 +489,85 @@ def test_scope_passed():
     assert found_scope["z"] == 3
 
 
-def test_wrap_unsound():
-    # TODO
-    pass
+def test_class_super():
+    class F:
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        def f(self):
+            return 1
+
+    class G(F):
+        def __init__(self, x, y):
+            self.x = x
+            self.y = y
+            super().__init__(x=x)
+
+    @maxray(increment_ints_by_one)
+    def fn(f, g):
+        # this errors
+        G(1, 2)
+        G(1, 2)
+        return 4
+
+    @maxray(increment_ints_by_one)
+    def fn_works(f, g):
+        # this doesn't
+        F
+        G
+        G(1, 2)
+        G(1, 2)
+        return 4
+
+    # When given an *instance*, the __init__ in F overwrites G.__init__
+    # However, given just F, it correctly patches F.__init__
+
+    f_instance = F()
+    g_instance = G(1, 2)
+    assert fn(f_instance, g_instance) == fn_works(f_instance, g_instance) == 5
+
+
+@pytest.mark.xfail
+def test_class_super_explicit():
+    class H0:
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        def f(self):
+            return 1
+
+    class H1(H0):
+        def __init__(self, x, y):
+            self.x = x
+            self.y = y
+            # This is currently not handled correctly
+            super(H1, self).__init__(x=x)
+
+    @maxray(increment_ints_by_one)
+    def fn():
+        H1(1, 2)
+        H1(1, 2)
+        return 4
+
+    assert fn() == 5
+
+
+def test_super_classmethod():
+    class S0:
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        @classmethod
+        def foo(cls):
+            return 1
+
+    class S1(S0):
+        @classmethod
+        def foo(cls):
+            return super().foo()
+
+    @maxray(increment_ints_by_one)
+    def fff():
+        return S1.foo()
+
+    assert fff() == 6

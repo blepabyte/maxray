@@ -74,6 +74,7 @@ class FnRewriter(ast.NodeTransformer):
         dedent_chars: int = 0,
         record_call_counts: bool = True,
         pass_locals_on_return: bool = False,
+        is_maxray_root: bool = False,
     ):
         """
         If we're transforming a method, instance type should be the __name__ of the class. Otherwise, None.
@@ -85,6 +86,7 @@ class FnRewriter(ast.NodeTransformer):
         self.dedent_chars = dedent_chars
         self.record_call_counts = record_call_counts
         self.pass_locals_on_return = pass_locals_on_return
+        self.is_maxray_root = is_maxray_root
 
         # the first `def` we encounter is the one that we're transforming. Subsequent ones will be nested/within class definitions.
         self.fn_count = 0
@@ -236,8 +238,28 @@ class FnRewriter(ast.NodeTransformer):
 
     def visit_Call(self, node):
         source_pre = self.recover_source(node)
-
         node_pre = deepcopy(node)
+
+        match node:
+            case ast.Call(func=ast.Name(id="super"), args=[]):
+                # HACK: STUPID HACKY HACK
+                # TODO: detect @classmethod properly
+                if "self" in self.fn_context.source:
+                    node.args = [
+                        ast.Name("__class__", ctx=ast.Load()),
+                        ast.Name("self", ctx=ast.Load()),
+                    ]
+                else:
+                    node.args = [
+                        ast.Name("__class__", ctx=ast.Load()),
+                        ast.Name("cls", ctx=ast.Load()),
+                    ]
+                node = ast.Call(
+                    func=ast.Name("_MAXRAY_PATCH_MRO", ctx=ast.Load()),
+                    args=[node],
+                    keywords=[],
+                )
+                ast.fix_missing_locations(node)
 
         node = self.generic_visit(node)  # mutates
 
@@ -249,32 +271,16 @@ class FnRewriter(ast.NodeTransformer):
             node_pre,
         )
 
-        id_key = f"{self.context_fn.__name__}/call/{source_pre}"
-        # Observes the *output* of the function
-        call_observer = ast.Call(
-            func=ast.Name(id=self.transform_fn.__name__, ctx=ast.Load()),
-            args=[node, ast.Constant({"id": id_key})],
-            keywords=[],
-        )
-        return call_observer
-
     def visit_FunctionDef(self, node: ast.FunctionDef):
         pre_node = deepcopy(node)
         self.fn_count += 1
 
         # Only overwrite the name of our "target function"
         if self.fn_count == 1 and self.is_method():
-            node.name = f"{node.name}_{_METHOD_MANGLE_NAME}_{node.name}"
-
-        # TODO: add is_root arg (whether fn has directly been decorated with @*xray)
+            node.name = f"{node.name}_{self.instance_type}_{node.name}"
 
         # Decorators are evaluated sequentially: decorators applied *before* our one (should?) get ignored while decorators applied *after* work correctly
-        is_transform_root = self.fn_count == 1 and any(
-            isinstance(decor, ast.Call)
-            and isinstance(decor.func, ast.Name)
-            and decor.func.id in {"maxray", "xray", "transform"}
-            for decor in node.decorator_list
-        )
+        is_transform_root = self.fn_count == 1 and self.is_maxray_root
 
         if is_transform_root:
             logger.info(
@@ -319,7 +325,7 @@ class FnRewriter(ast.NodeTransformer):
         self.fn_count += 1
         # Only overwrite the name of our "target function"
         if self.fn_count == 1 and self.is_method():
-            node.name = f"{node.name}_{_METHOD_MANGLE_NAME}_{node.name}"
+            node.name = f"{node.name}_{self.instance_type}_{node.name}"
 
         is_transform_root = self.fn_count == 1 and any(
             isinstance(decor, ast.Call)
@@ -370,6 +376,7 @@ def recompile_fn_with_transform(
     initial_scope={},
     pass_scope=False,
     special_use_instance_type=None,
+    is_maxray_root=False,
 ) -> Result[Callable, str]:
     """
     Recompiles `source_fn` so that essentially every node of its AST tree is wrapped by a call to `transform_fn` with the evaluated value along with context information about the source code.
@@ -415,12 +422,6 @@ def recompile_fn_with_transform(
     except SyntaxError:
         return Err(f"Syntax error in function {get_fn_name(source_fn)}")
 
-    if "super()" in source:
-        # TODO: we could replace calls to super() with super(__class__, self)?
-        return Err(
-            f"Function {get_fn_name(source_fn)} cannot be transformed because it calls super()"
-        )
-
     match fn_ast:
         case ast.Module(body=[ast.FunctionDef() | ast.AsyncFunctionDef()]):
             # Good
@@ -458,17 +459,29 @@ def recompile_fn_with_transform(
         sourcefile,
         fn_call_counter,
     )
+    instance_type = parent_cls.__name__ if fn_is_method else None
     transformed_fn_ast = FnRewriter(
         transform_fn,
         fn_context,
-        instance_type=parent_cls.__name__ if fn_is_method else None,
+        instance_type=instance_type,
         dedent_chars=dedent_chars,
         pass_locals_on_return=pass_scope,
+        is_maxray_root=is_maxray_root,
     ).visit(fn_ast)
     ast.fix_missing_locations(transformed_fn_ast)
 
     if ast_post_callback is not None:
         ast_post_callback(transformed_fn_ast)
+
+    def patch_mro(super_type: super):
+        for parent_type in super_type.__self_class__.mro():
+            # Ok that's weird - this function gets picked up by the maxray decorator and seems to correctly patch the parent types - so despite looking like this function does absolutely nothing, it actually *has* side-effects
+            if not hasattr(parent_type, "__init__") or hasattr(
+                parent_type.__init__, "_MAXRAY_TRANSFORMED"
+            ):
+                continue
+
+        return super_type
 
     scope = {
         transform_fn.__name__: transform_fn,
@@ -477,6 +490,7 @@ def recompile_fn_with_transform(
         "_MAXRAY_CALL_COUNTER": fn_call_counter,
         "_MAXRAY_DECORATE_WITH_COUNTER": count_calls_with,
         "_MAXRAY_BUILTINS_LOCALS": locals,
+        "_MAXRAY_PATCH_MRO": patch_mro,
     }
     scope.update(initial_scope)
 
@@ -568,13 +582,13 @@ def recompile_fn_with_transform(
 
     if fn_is_method:
         transformed_fn = scope[
-            f"{source_fn.__name__}_{_METHOD_MANGLE_NAME}_{source_fn.__name__}"
+            f"{source_fn.__name__}_{instance_type}_{source_fn.__name__}"
         ]
     else:
         transformed_fn = scope[source_fn.__name__]
 
     # a decorator doesn't actually have to return a function! (could be used solely for side effect) e.g. `@register_backend_lookup_factory` for `find_content_backend` in `awkward/contents/content.py`
-    if not callable(transformed_fn):
+    if not callable(transformed_fn) and not inspect.ismethoddescriptor(transformed_fn):
         return Err(
             f"Resulting transform of definition of {get_fn_name(source_fn)} is not even callable (got {transform_fn}). Perhaps a decorator that returns None?"
         )

@@ -9,6 +9,9 @@ from result import Result, Ok, Err
 
 from loguru import logger
 
+# Avoid logspam for users of the library
+logger.disable("maxray")
+
 
 def transform(writer):
     """
@@ -16,7 +19,7 @@ def transform(writer):
     """
 
     def inner(fn):
-        match recompile_fn_with_transform(fn, writer):
+        match recompile_fn_with_transform(fn, writer, is_maxray_root=True):
             case Ok(trans_fn):
                 return wraps(fn)(trans_fn)
             case Err(err):
@@ -39,7 +42,11 @@ _GLOBAL_SKIP_MODULES = {
     "pathlib",  # internally used in transform for checking source file exists
     "re",  # internals of regexp have a lot of uninteresting step methods
     "copy",  # pytorch spends so much time in here
+    "typing",
+    "importlib",
+    "loguru",  # used internally in transform - accidental patching will cause inf recursion
 }
+# TODO: probably just skip the entire Python standard library...
 
 
 @dataclass
@@ -77,6 +84,7 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
         and callable(x)
         and callable(getattr(x, "__hash__", None))
         and getattr(type(x), "__module__", None) not in {"ctypes"}
+        and (inspect.isfunction(x) or inspect.ismethod(x))
     )
 
 
@@ -118,7 +126,7 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                 logger.info(f"Patching __init__ for class {x}")
                 setattr(x, "__init__", init_patch)
 
-    if instance_call_allowed_for_transform(x, ctx):
+    elif instance_call_allowed_for_transform(x, ctx):
         # TODO: should we somehow delay doing this until before an actual call?
         match recompile_fn_with_transform(
             x.__call__, _maxray_walker_handler, special_use_instance_type=x
@@ -128,8 +136,8 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                 setattr(x, "__call__", call_patch)
 
     # 1b. normal functions or bound methods or method descriptors like @classmethod and @staticmethod
-    if callable_allowed_for_transform(x, ctx):
-        # TODO: don't cache objects w/ __call__
+    elif callable_allowed_for_transform(x, ctx):
+        # We can only cache functions - as caching invokes __hash__, which may fail badly on incompletely-initialised class instances w/ __call__ methods, like torch._ops.OpOverload
         if x in _MAXRAY_FN_CACHE:
             x = _MAXRAY_FN_CACHE[x]
         elif not any(
@@ -174,8 +182,8 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                 case Err(e):
                     # Cache failures
                     _MAXRAY_FN_CACHE[x] = x
-                    # Errors in functions that have been recursively compiled are unimportant
-                    logger.trace(f"Failed to transform in walker handler: {e}")
+                    # Errors in functions that have been recursively compiled are less important
+                    logger.warning(f"Failed to transform in walker handler: {e}")
 
     # 2. run the active hooks
     global_write_active_token = _GLOBAL_WRITER_ACTIVE_FLAG.set(True)
@@ -250,6 +258,7 @@ def maxray(
                 _maxray_walker_handler,
                 initial_scope=caller_locals,
                 pass_scope=pass_scope,
+                is_maxray_root=True,
             ):
                 case Ok(fn_transform):
                     pass
