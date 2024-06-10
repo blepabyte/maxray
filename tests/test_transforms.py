@@ -571,3 +571,53 @@ def test_super_classmethod():
         return S1.foo()
 
     assert fff() == 6
+
+
+def test_partialmethod():
+    from functools import partialmethod
+
+    # TQDM threw an error from partialmethod via @env_wrap but can't seem to reproduce
+    @xray(dbg)
+    def run_part():
+        class X:
+            def set_state(self, active: bool):
+                self.active = active
+
+            set_active = partialmethod(set_state, True)
+
+        x = X()
+        x.set_active()
+
+        assert x.active
+
+    run_part()
+
+
+def test_caller_id():
+    f1_id = None
+    f2_id = None
+
+    def collect_ids(x, ctx: NodeContext):
+        if ctx.source == "f1()":
+            nonlocal f1_id
+            f1_id = ctx.caller_id
+        elif ctx.source == "f2()":
+            nonlocal f2_id
+            f2_id = ctx.caller_id
+
+    def f1():
+        return 1
+
+    def f2():
+        return 2
+
+    @xray(collect_ids)
+    def func():
+        f1()
+        f2()
+
+    func()
+
+    assert f1._MAXRAY_TRANSFORM_ID == f1_id
+    assert f2._MAXRAY_TRANSFORM_ID == f2_id
+    assert f1_id != f2_id
