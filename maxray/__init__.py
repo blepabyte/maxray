@@ -260,6 +260,7 @@ def maxray(
     *,
     mutable=True,
     pass_scope=False,
+    initial_scope={},
 ):
     """
     A transform that recursively hooks into all further calls made within the function, so that `writer` will (in theory) observe every single expression evaluated by the Python interpreter occurring as part of the decorated function call.
@@ -284,7 +285,7 @@ def maxray(
     #     del frame
 
     # TODO: allow configuring injection of variables into exec scope
-    caller_locals = {}
+    caller_locals = initial_scope
 
     def recursive_transform(fn):
         _MAXRAY_REGISTERED_HOOKS.append(
@@ -304,7 +305,7 @@ def maxray(
             match recompile_fn_with_transform(
                 fn,
                 _maxray_walker_handler,
-                initial_scope=caller_locals,
+                override_scope=caller_locals,
                 pass_scope=pass_scope,
                 is_maxray_root=True,
             ):

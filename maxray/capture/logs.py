@@ -9,12 +9,26 @@ from pyarrow import feather as ft
 from contextvars import ContextVar
 from functools import wraps
 import time
+from pathlib import Path
 
 from loguru import logger
 
 
 class CaptureLogs:
     instance = ContextVar("CaptureLogs")
+
+    LSP_NO_SHOW_TYPES = {
+        "type",
+        "function",
+        "builtin_function_or_method",
+        "staticmethod",
+        "method",
+        "module",
+        "NoneType",
+        "int",  # mostly uninteresting and makes array indexing expressions cluttered
+        "int32",
+        "int64",
+    }
 
     @staticmethod
     def extractor(x, ctx: NodeContext):
@@ -36,13 +50,24 @@ class CaptureLogs:
                 instance.builder("source_file").append(ctx.fn_context.source_file)
                 instance.builder("source").append(ctx.source)
 
-                assert isinstance(ctx.fn_context.name, str)
                 instance.builder("fn").append(ctx.fn_context.name)
                 instance.builder("fn_call_count").append(
                     ctx.fn_context.call_count.get()
                 )
-                instance.builder("struct_repr").append(structured_repr(x))
-                instance.builder("value_type").append(repr(type(x)))
+
+                struct_repr = structured_repr(x)
+                instance.builder("struct_repr").append(struct_repr)
+
+                value_type = repr(type(x))
+                instance.builder("value_type").append(value_type)
+
+                type_name = type(x).__name__
+                if type_name in CaptureLogs.LSP_NO_SHOW_TYPES:
+                    instance.builder("lsp_repr").append(None)
+                else:
+                    instance.builder("lsp_repr").append(
+                        f" {struct_repr}"
+                    )  # space inserted for formatting
 
                 instance.builder("timestamp").append(time.perf_counter())
 
@@ -52,7 +77,9 @@ class CaptureLogs:
 
         return x
 
-    def __init__(self):
+    def __init__(self, from_script_path=None):
+        # TODO: support in-memory mode
+
         # Maps function UUIDs (_MAXRAY_TRANSFORM_ID) to FnContext instances
         self.fn_sources = {}
 
@@ -74,11 +101,16 @@ class CaptureLogs:
             "source": pa.string(),
             # Extracted data
             "struct_repr": pa.string(),
+            "lsp_repr": pa.string(),
             "value_type": pa.string(),
             "timestamp": pa.float64(),
         }
 
-        self.save_to = "/tmp/maxray-logs.arrow"
+        log_file_name = ".maxray-logs.arrow"
+        if from_script_path is not None:
+            self.save_to = Path(from_script_path).resolve(True).parent / log_file_name
+        else:
+            self.save_to = Path("/tmp") / log_file_name
 
         self.flush_every_records = 10_000
 
@@ -94,6 +126,10 @@ class CaptureLogs:
         return self.builders[name]
 
     def flush(self):
+        if not self.builders:
+            logger.warning("Nothing to flush")
+            return
+
         arrays, names = [], []
         for col_name, col_type in self.type_schema.items():
             builder = self.builders[col_name]
@@ -111,7 +147,7 @@ class CaptureLogs:
 
         # TODO: forbid re-entry
 
-        self.sink = self.write_context.enter_context(pa.OSFile(self.save_to, "wb"))
+        self.sink = self.write_context.enter_context(pa.OSFile(str(self.save_to), "wb"))
         self.writer = self.write_context.enter_context(
             pa.ipc.new_file(self.sink, self.schema())
         )
@@ -119,6 +155,8 @@ class CaptureLogs:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
+            self.flush()
+
             if exc_type is not None:
                 return
 
