@@ -156,23 +156,22 @@ def _maxray_walker_handler(x, ctx: NodeContext):
     # 1.  logic to recursively patch callables
     # 1a. special-case callables: __init__ and __call__
     if instance_init_allowed_for_transform(x, ctx):
-        # TODO: should we somehow delay doing this until before an actual call?
         match recompile_fn_with_transform(
             x.__init__, _maxray_walker_handler, special_use_instance_type=x
         ):
             case Ok(init_patch):
-                logger.info(f"Patching __init__ for class {x}")
+                logger.debug(f"Patching __init__ for class {x}")
                 setattr(x, "__init__", init_patch)
+            # TODO: consolidate error handling and reporting
             # case Err(bad):
             #     logger.error(bad)
 
     elif instance_call_allowed_for_transform(x, ctx):
-        # TODO: should we somehow delay doing this until before an actual call?
         match recompile_fn_with_transform(
             x.__call__, _maxray_walker_handler, special_use_instance_type=x
         ):
             case Ok(call_patch):
-                logger.info(f"Patching __call__ for class {x}")
+                logger.debug(f"Patching __call__ for class {x}")
                 setattr(x, "__call__", call_patch)
             # case Err(bad):
             #     logger.error(bad)
@@ -223,6 +222,11 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                     _MAXRAY_FN_CACHE[x] = x
                     # Errors in functions that have been recursively compiled are less important
                     logger.warning(f"Failed to transform in walker handler: {e}")
+
+    # We ignore writer calls triggered by code execution in other writers to prevent easily getting stuck in recursive hell
+    # This happens *after* checking and patching callables to still allow for explicitly patching a callable/method by calling this handler
+    if _GLOBAL_WRITER_ACTIVE_FLAG.get():
+        return x
 
     # 2. run the active hooks
     global_write_active_token = _GLOBAL_WRITER_ACTIVE_FLAG.set(True)
