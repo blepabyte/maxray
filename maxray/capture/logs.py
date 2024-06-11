@@ -155,13 +155,12 @@ class CaptureLogs:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
-            self.flush()
-
             if exc_type is not None:
                 return
 
             CaptureLogs.instance.set(None)
         finally:
+            self.flush()
             self.write_context.__exit__(exc_type, exc_val, exc_tb)
 
     @staticmethod
