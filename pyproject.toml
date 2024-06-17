@@ -14,7 +14,10 @@ Tracker = "https://github.com/blepabyte/maxray/issues"
 python = "^3.11"
 result = "^0.16.1"
 loguru = "^0.7.2"
+pyarrow = "^16.1.0"
 
+[tool.poetry.scripts]
+xpy = "maxray.capture.logs_cli:run_script"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"

@@ -58,6 +58,9 @@ class NodeContext:
     """
 
     location: tuple[int, int, int, int]
+    """
+    (start_line, end_line, start_col, end_col)
+    """
 
     local_scope: Any = None
 
@@ -458,7 +461,7 @@ def recompile_fn_with_transform(
     transform_fn,
     ast_pre_callback=None,
     ast_post_callback=None,
-    initial_scope={},
+    override_scope={},
     pass_scope=False,
     special_use_instance_type=None,
     is_maxray_root=False,
@@ -555,7 +558,7 @@ def recompile_fn_with_transform(
     fn_call_counter = ContextVar("maxray_call_counter", default=0)
     fn_context = FnContext(
         source_fn,
-        source_fn.__name__,
+        source_fn.__qualname__,
         module.__name__,
         source,
         sourcefile,
@@ -595,7 +598,7 @@ def recompile_fn_with_transform(
             "_MAXRAY_BUILTINS_LOCALS": locals,
             "_MAXRAY_PATCH_MRO": patch_mro,
         },
-        "override": initial_scope,
+        "override": override_scope,
         "class_local": {},
         "module": {},
         "closure": {},
