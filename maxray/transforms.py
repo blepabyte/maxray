@@ -1,10 +1,11 @@
 import ast
 import inspect
 import sys
+import uuid
 
 from textwrap import dedent
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from copy import deepcopy
 from result import Result, Ok, Err
 from contextvars import ContextVar
@@ -60,8 +61,24 @@ class NodeContext:
 
     local_scope: Any = None
 
+    caller_id: Any = None
+
     def __repr__(self):
         return f"{self.fn_context}/{self.id}"
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "source": self.source,
+            "location": self.location,
+            "caller_id": self.caller_id,
+            "fn_context": {
+                "name": self.fn_context.name,
+                "module": self.fn_context.module,
+                "source_file": self.fn_context.source_file,
+                "call_count": self.fn_context.call_count.get(),
+            },
+        }
 
 
 class FnRewriter(ast.NodeTransformer):
@@ -120,10 +137,13 @@ class FnRewriter(ast.NodeTransformer):
             return self.safe_unparse(pre_node)
         return segment
 
-    def build_transform_node(self, node, label, node_source=None, pass_locals=False):
+    def build_transform_node(
+        self, node, label, node_source=None, pass_locals=False, extra_kwargs=None
+    ):
         """
         Builds the "inspection" node that wraps the original source node - passing the (value, context) pair to `transform_fn`.
         """
+        node = deepcopy(node)
         if node_source is None:
             node_source = self.safe_unparse(node)
 
@@ -145,28 +165,38 @@ class FnRewriter(ast.NodeTransformer):
             ),
         ]
 
+        keyword_args = []
+
+        if extra_kwargs is not None:
+            keyword_args.extend(extra_kwargs)
+
         if pass_locals:
-            context_args.append(
-                ast.Call(
-                    func=ast.Name(id="_MAXRAY_BUILTINS_LOCALS", ctx=ast.Load()),
-                    args=[],
-                    keywords=[],
-                ),
+            keyword_args.append(
+                ast.keyword(
+                    arg="local_scope",
+                    value=ast.Call(
+                        func=ast.Name(id="_MAXRAY_BUILTINS_LOCALS", ctx=ast.Load()),
+                        args=[],
+                        keywords=[],
+                    ),
+                )
             )
+
         context_node = ast.Call(
             func=ast.Name(id=NodeContext.__name__, ctx=ast.Load()),
             args=context_args,
-            keywords=[],
+            keywords=keyword_args,
         )
-
-        return ast.Call(
+        ret = ast.Call(
             func=ast.Name(id=self.transform_fn.__name__, ctx=ast.Load()),
             args=[node, context_node],
             keywords=[],
         )
+        return ret
 
     def visit_Name(self, node):
         source_pre = self.recover_source(node)
+        node = deepcopy(node)
 
         match node.ctx:
             case ast.Load():
@@ -189,6 +219,7 @@ class FnRewriter(ast.NodeTransformer):
         > Private name mangling: When an identifier that textually occurs in a class definition begins with two or more underscore characters and does not end in two or more underscores, it is considered a private name of that class. Private names are transformed to a longer form before code is generated for them. The transformation inserts the class name, with leading underscores removed and a single underscore inserted, in front of the name. For example, the identifier __spam occurring in a class named Ham will be transformed to _Ham__spam. This transformation is independent of the syntactical context in which the identifier is used. If the transformed name is extremely long (longer than 255 characters), implementation defined truncation may happen. If the class name consists only of underscores, no transformation is done.
         """
         source_pre = self.recover_source(node)
+        node = deepcopy(node)
 
         if self.is_method() and self.is_private_class_name(node.attr):
             node.attr = f"_{self.instance_type}{node.attr}"
@@ -208,6 +239,7 @@ class FnRewriter(ast.NodeTransformer):
         return node
 
     def visit_Assign(self, node: ast.Assign) -> Any:
+        node = deepcopy(node)
         new_node = self.generic_visit(node)
         assert isinstance(new_node, ast.Assign)
         # node = new_node
@@ -216,6 +248,7 @@ class FnRewriter(ast.NodeTransformer):
 
     def visit_Return(self, node: ast.Return) -> Any:
         node_pre = deepcopy(node)
+        node = deepcopy(node)
 
         if node.value is None:
             node.value = ast.Constant(None)
@@ -236,9 +269,37 @@ class FnRewriter(ast.NodeTransformer):
 
         return ast.copy_location(node, node_pre)
 
+    @staticmethod
+    def temp_binding(node, by_name: str):
+        return ast.fix_missing_locations(
+            ast.Call(
+                ast.Name("_MAXRAY_SET_TEMP", ctx=ast.Load()),
+                [node, ast.Constant(by_name)],
+                keywords=[],
+            )
+        )
+        # Cannot use walrus expressions in nested list comprehension context
+        # return ast.fix_missing_locations(
+        #     ast.Subscript(
+        #         value=ast.Tuple(
+        #             elts=[
+        #                 ast.NamedExpr(
+        #                     target=ast.Name(id=by_name, ctx=ast.Store()),
+        #                     value=node,
+        #                 ),
+        #                 ast.Name(id=by_name, ctx=ast.Load()),
+        #             ],
+        #             ctx=ast.Load(),
+        #         ),
+        #         slice=ast.Constant(-1),
+        #         ctx=ast.Load(),
+        #     )
+        # )
+
     def visit_Call(self, node):
         source_pre = self.recover_source(node)
         node_pre = deepcopy(node)
+        node = deepcopy(node)
 
         match node:
             case ast.Call(func=ast.Name(id="super"), args=[]):
@@ -262,17 +323,44 @@ class FnRewriter(ast.NodeTransformer):
                 ast.fix_missing_locations(node)
 
         node = self.generic_visit(node)  # mutates
+        # Want to keep track of which function we're calling
+        # `node.func` is now likely a call to `_maxray_walker_handler`
+        node.func = self.temp_binding(node.func, "_MAXRAY_TEMP_VAR")
+        # We can't use `node_pre.func` beacuse evaluating it has side effects
+
+        # TODO: maybe assign the super() proxy and do the MRO patching at the start of the function
+        extra_kwargs = []
+        if "super" not in source_pre:
+            extra_kwargs.append(
+                ast.keyword(
+                    "caller_id",
+                    # value=ast.Name("_MAXRAY_TEMP_VAR", ctx=ast.Load()),
+                    value=ast.Call(
+                        func=ast.Name("getattr", ctx=ast.Load()),
+                        args=[
+                            ast.Name("_MAXRAY_TEMP_VAR", ctx=ast.Load()),
+                            ast.Constant("_MAXRAY_TRANSFORM_ID"),
+                            ast.Constant(None),
+                        ],
+                        keywords=[],
+                    ),
+                )
+            )
 
         # the function/callable instance itself is observed by Name/Attribute/... nodes
         return ast.copy_location(
             self.build_transform_node(
-                node, f"call/{source_pre}", node_source=source_pre
+                node,
+                f"call/{source_pre}",
+                node_source=source_pre,
+                extra_kwargs=extra_kwargs,
             ),
             node_pre,
         )
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         pre_node = deepcopy(node)
+        node = deepcopy(node)
         self.fn_count += 1
 
         # Only overwrite the name of our "target function"
@@ -283,9 +371,6 @@ class FnRewriter(ast.NodeTransformer):
         is_transform_root = self.fn_count == 1 and self.is_maxray_root
 
         if is_transform_root:
-            logger.info(
-                f"Wiped decorators at level {self.fn_count} for {self.fn_context.impl_fn}: {node.decorator_list}"
-            )
             # If we didn't clear, decorators would be applied twice - screwing up routing handling in libraries like `quart`: `@app.post("/generate")`
             node.decorator_list = []
 
@@ -381,6 +466,17 @@ def recompile_fn_with_transform(
     """
     Recompiles `source_fn` so that essentially every node of its AST tree is wrapped by a call to `transform_fn` with the evaluated value along with context information about the source code.
     """
+
+    # Could store as bytes but extra memory insignificant
+    # Even failed transforms should get ids assigned and returned as part of Err for tracking
+    # TODO: assign as field, and use instead of cache?
+    # TODO: hash based on properties so consistent across program runs
+    maxray_assigned_id = str(uuid.uuid4())
+    try:
+        source_fn._MAXRAY_TRANSFORM_ID = maxray_assigned_id
+    except AttributeError:
+        pass
+
     # TODO: use non-overridable __getattribute__ instead?
     if not hasattr(source_fn, "__name__"):  # Safety check against weird functions
         return Err(f"There is no __name__ for function {get_fn_name(source_fn)}")
@@ -494,6 +590,12 @@ def recompile_fn_with_transform(
     }
     scope.update(initial_scope)
 
+    # BUG: this will NOT work with threading - could use ContextVar if no performance impact?
+    def set_temp(val, name: str):
+        scope[name] = val
+        return val
+
+    scope["_MAXRAY_SET_TEMP"] = set_temp
     # Add class-private names to scope (though only should be usable as a default argument)
     # TODO: should apply to all definitions within a class scope - so @staticmethod descriptors as well...
     if fn_is_method:
@@ -546,9 +648,9 @@ def recompile_fn_with_transform(
         logger.error(
             f"Failed to compile function `{source_fn.__name__}` at '{sourcefile}' in its module {module}"
         )
-        logger.debug(f"Relevant original source code:\n{source}")
-        logger.debug(f"Corresponding AST:\n{FnRewriter.safe_show_ast(fn_ast)}")
-        logger.debug(
+        logger.trace(f"Relevant original source code:\n{source}")
+        logger.trace(f"Corresponding AST:\n{FnRewriter.safe_show_ast(fn_ast)}")
+        logger.trace(
             f"Transformed code we attempted to compile:\n{FnRewriter.safe_unparse(transformed_fn_ast)}"
         )
 
@@ -598,6 +700,7 @@ def recompile_fn_with_transform(
 
     # way to keep track of which functions we've already transformed
     transformed_fn._MAXRAY_TRANSFORMED = True
+    transformed_fn._MAXRAY_TRANSFORM_ID = maxray_assigned_id
 
     return Ok(transformed_fn)
 
