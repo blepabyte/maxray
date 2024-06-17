@@ -568,6 +568,7 @@ def test_super_classmethod():
 
     @maxray(increment_ints_by_one)
     def fff():
+        # S0.foo
         return S1.foo()
 
     assert fff() == 6

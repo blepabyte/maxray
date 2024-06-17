@@ -1,4 +1,5 @@
 from .transforms import recompile_fn_with_transform, NodeContext
+from .function_store import FunctionStore
 
 import inspect
 from weakref import ref, WeakSet
@@ -12,7 +13,6 @@ from result import Result, Ok, Err
 import os
 
 from loguru import logger
-
 
 if not os.environ.get("MAXRAY_LOG_LEVEL"):
     # Avoid logspam for users of the library
@@ -198,7 +198,10 @@ def _maxray_walker_handler(x, ctx: NodeContext):
             match recompile_fn_with_transform(x, _maxray_walker_handler):
                 case Ok(x_trans):
                     # NOTE: x_trans now has _MAXRAY_TRANSFORMED field to True
+                    with_fn = FunctionStore.get(x_trans._MAXRAY_TRANSFORM_ID)
+
                     if inspect.ismethod(x):
+                        # if with_fn.method is not None:
                         # Two cases: descriptor vs bound method
                         match x.__self__:
                             case type():
@@ -213,6 +216,11 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                                     f"monkey-patching bound method {x.__name__} on type {type(x.__self__)}"
                                 )
                                 parent_cls = type(x.__self__)
+                        # parent_cls = with_fn.method.defined_on_cls
+                        # parent_cls = with_fn.method.instance_cls
+                        # logger.success(
+                        #     f"monkey-patching bound method {x.__name__} on type {parent_cls} / {with_fn.method.defined_on_cls}"
+                        # )
 
                         # Monkey-patching the methods. Probably unsafe and unsound
                         setattr(parent_cls, x.__name__, x_trans)
