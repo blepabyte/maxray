@@ -266,6 +266,7 @@ def maxray(
     mutable=True,
     pass_scope=False,
     initial_scope={},
+    assume_transformed=False,
 ):
     """
     A transform that recursively hooks into all further calls made within the function, so that `writer` will (in theory) observe every single expression evaluated by the Python interpreter occurring as part of the decorated function call.
@@ -304,7 +305,7 @@ def maxray(
         )
 
         # Fixes `test_double_decorators_with_locals`: repeated transforms are broken because stuffing closures into locals doesn't work the second time around
-        if hasattr(fn, "_MAXRAY_TRANSFORMED"):
+        if hasattr(fn, "_MAXRAY_TRANSFORMED") or assume_transformed:
             fn_transform = fn
         else:
             match recompile_fn_with_transform(

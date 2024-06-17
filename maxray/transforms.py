@@ -378,6 +378,17 @@ class FnRewriter(ast.NodeTransformer):
         if is_transform_root:
             # If we didn't clear, decorators would be applied twice - screwing up routing handling in libraries like `quart`: `@app.post("/generate")`
             node.decorator_list = []
+        else:
+            # Handle nested @xray calls (e.g. running via `xpy` - everything inside has already been transformed but there won't be source code)
+            for dec in node.decorator_list:
+                match dec:
+                    case ast.Call(func=ast.Name(id="maxray" | "xray")):
+                        dec.keywords.append(
+                            ast.keyword(
+                                "assume_transformed",
+                                value=ast.Constant(True),
+                            )
+                        )
 
         # Removes type annotations from the call for safety as they're evaluated at definition-time rather than call-time
         # Necessary because some packages do `if typing.TYPE_CHECKING` imports
@@ -518,8 +529,6 @@ def recompile_fn_with_transform(
             return Err(
                 f"Non-existent source module `{getattr(source_fn, '__module__', None)}` for function {get_fn_name(source_fn)}"
             )
-
-        fn_ast = ast.parse(source)
     except OSError:
         return Err(f"No source code for function {get_fn_name(source_fn)}")
     except TypeError:
