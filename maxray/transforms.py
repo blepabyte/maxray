@@ -509,6 +509,11 @@ def recompile_fn_with_transform(
                 f"Non-existent source file ({sourcefile}) for function {get_fn_name(source_fn)}"
             )
 
+        if module is None:
+            return Err(
+                f"Non-existent source module `{getattr(source_fn, '__module__', None)}` for function {get_fn_name(source_fn)}"
+            )
+
         fn_ast = ast.parse(source)
     except OSError:
         return Err(f"No source code for function {get_fn_name(source_fn)}")
