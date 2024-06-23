@@ -71,6 +71,7 @@ def test_pytorch_nograd_context():
     assert check_cmp() is True
 
 
+@if_package("pandas")
 def test_pandas_dataframe_ops():
     import pandas as pd
 
@@ -116,6 +117,7 @@ def test_pandas_dataframe_ops():
     assert (xray(dbg)(group_dataframes)() == group_dataframes()).all().all()
 
 
+@if_package("numpy")
 def test_numpy_formats():
     import numpy as np
 
