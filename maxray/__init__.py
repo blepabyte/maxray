@@ -9,10 +9,14 @@ from functools import wraps, _lru_cache_wrapper
 from typing import Any, Callable
 from result import Result, Ok, Err
 
+import os
+
 from loguru import logger
 
-# Avoid logspam for users of the library
-logger.disable("maxray")
+
+if not os.environ.get("MAXRAY_LOG_LEVEL"):
+    # Avoid logspam for users of the library
+    logger.disable("maxray")
 
 
 def _set_logging(enabled: bool):
@@ -116,8 +120,9 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
         return False
     # TODO: deal with nonhashable objects and callables and other exotic types properly
     return (
-        not hasattr(x, "_MAXRAY_TRANSFORMED")
-        and callable(x)
+        callable(x)  # super() has getset_descriptor instead of proper __dict__
+        and hasattr(x, "__dict__")
+        and "_MAXRAY_TRANSFORMED" not in x.__dict__
         and callable(getattr(x, "__hash__", None))
         and getattr(type(x), "__module__", None) not in {"ctypes"}
         and (

@@ -2,6 +2,8 @@ import ast
 import inspect
 import sys
 import uuid
+import re
+import builtins
 
 from textwrap import dedent
 from pathlib import Path
@@ -524,8 +526,15 @@ def recompile_fn_with_transform(
         return Err(
             f"No source code for probable built-in function {get_fn_name(source_fn)}"
         )
+
+    try:
+        fn_ast = ast.parse(source)
     except SyntaxError:
         return Err(f"Syntax error in function {get_fn_name(source_fn)}")
+
+    # TODO: be smarter and look for global/nonlocal statements in the parsed repr instead
+    if "global " in source:
+        return Err("Cannot safely transform functions containing `global` declarations")
 
     match fn_ast:
         case ast.Module(body=[ast.FunctionDef() | ast.AsyncFunctionDef()]):
@@ -647,8 +656,9 @@ def recompile_fn_with_transform(
     try:
         # TODO: this might be slow
         scope = {
-            **scope_layers["core"],
             **scope_layers["class_local"],
+            **vars(builtins),
+            **scope_layers["core"],
             **scope_layers["module"],
             **scope_layers["closure"],
             **scope_layers["override"],
@@ -686,8 +696,9 @@ def recompile_fn_with_transform(
         if sourcefile in file_to_modules:
             # Re-executing in a different module: re-declare scope without the previous module (otherwise we get incorrect behaviour like `min` being replaced with `np.amin` in `np.load`)
             scope = {
-                **scope_layers["core"],
                 **scope_layers["class_local"],
+                **vars(builtins),
+                **scope_layers["core"],
                 **vars(file_to_modules[sourcefile]),
                 **scope_layers["closure"],
                 **scope_layers["override"],
