@@ -6,6 +6,7 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: Publish
     concurrency: publish
     permissions: write-all
 
