@@ -30,6 +30,8 @@ class CaptureLogs:
         "int64",
     }
 
+    DEFAULT_LOG_FILE_NAME = ".maxray-logs.arrow"
+
     @staticmethod
     def extractor(x, ctx: NodeContext):
         if isinstance(instance := CaptureLogs.instance.get(None), CaptureLogs):
@@ -77,9 +79,7 @@ class CaptureLogs:
 
         return x
 
-    def __init__(self, from_script_path=None):
-        # TODO: support in-memory mode
-
+    def __init__(self, stream_to_arrow_file=None, flush_every_records: int = 10_000):
         # Maps function UUIDs (_MAXRAY_TRANSFORM_ID) to FnContext instances
         self.fn_sources = {}
 
@@ -106,13 +106,22 @@ class CaptureLogs:
             "timestamp": pa.float64(),
         }
 
-        log_file_name = ".maxray-logs.arrow"
-        if from_script_path is not None:
-            self.save_to = Path(from_script_path).resolve(True).parent / log_file_name
+        if stream_to_arrow_file is not None:
+            stream_to_arrow_file = Path(stream_to_arrow_file)
+            if stream_to_arrow_file.exists():
+                self.save_to = (
+                    stream_to_arrow_file.resolve(True).parent
+                    / self.DEFAULT_LOG_FILE_NAME
+                )
+            else:
+                self.save_to = stream_to_arrow_file
         else:
-            self.save_to = Path("/tmp") / log_file_name
+            self.save_to = None
 
-        self.flush_every_records = 10_000
+        # TODO: clearer separation of in-memory and write-to-sink modes
+        self.in_memory_batches = []
+
+        self.flush_every_records = flush_every_records
 
         self.write_context = ExitStack()
 
@@ -139,7 +148,10 @@ class CaptureLogs:
             builder.clear()
 
         batch = pa.RecordBatch.from_arrays(arrays=arrays, names=names)
-        self.writer.write(batch)
+        if self.save_to is not None:
+            self.writer.write(batch)
+        else:
+            self.in_memory_batches.append(batch)
         return batch
 
     def __enter__(self):
@@ -147,10 +159,13 @@ class CaptureLogs:
 
         # TODO: forbid re-entry
 
-        self.sink = self.write_context.enter_context(pa.OSFile(str(self.save_to), "wb"))
-        self.writer = self.write_context.enter_context(
-            pa.ipc.new_file(self.sink, self.schema())
-        )
+        if self.save_to is not None:
+            self.sink = self.write_context.enter_context(
+                pa.OSFile(str(self.save_to), "wb")
+            )
+            self.writer = self.write_context.enter_context(
+                pa.ipc.new_file(self.sink, self.schema())
+            )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -163,12 +178,11 @@ class CaptureLogs:
             self.flush()
             self.write_context.__exit__(exc_type, exc_val, exc_tb)
 
+    def collect(self):
+        return pa.Table.from_batches(self.in_memory_batches, schema=self.schema())
+
     @staticmethod
     def attach(*, debug: bool = False):
-        """
-        If
-        """
-
         def decor(f):
             fx = xray(CaptureLogs.extractor)(f)
 
