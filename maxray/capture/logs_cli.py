@@ -2,6 +2,7 @@ from maxray import maxray, NodeContext
 from maxray.capture.logs import CaptureLogs
 from maxray.function_store import FunctionStore
 
+import pyarrow.compute as pc
 import pyarrow.feather as ft
 import watchfiles
 
@@ -268,7 +269,19 @@ class ScriptRunner:
         finally:
             sys.path = prev_sys_path
 
-        return ScriptOutput(cl.collect(), FunctionStore.collect(), exc, final_scope)
+        functions_table = FunctionStore.collect()
+        # Patch the correct source file names (temporary -> actual)
+        sf_col_idx = functions_table.column_names.index("source_file")
+        remapped_source_file = pc.replace_substring_regex(
+            functions_table["source_file"],
+            pattern=rf"^{self.temp_sourcefile.name}$",
+            replacement=f"{self.run_type.sourcemap_to()}",
+        )
+        functions_table = functions_table.set_column(
+            sf_col_idx, functions_table.field(sf_col_idx), remapped_source_file
+        )
+
+        return ScriptOutput(cl.collect(), functions_table, exc, final_scope)
 
     def rewrite_node(self, x, ctx: NodeContext):
         # functions and contextvars can't be deepcopied
