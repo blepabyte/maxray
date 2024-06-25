@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "maxray"
-version = "0.2.0"
+version = "0.3.0"
 description = ""
 authors = ["blepabyte <255@blepabyte.me>"]
 readme = "README.md"
