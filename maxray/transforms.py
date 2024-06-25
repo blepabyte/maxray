@@ -1,3 +1,5 @@
+from .function_store import WithFunction, get_fn_name
+
 import ast
 import inspect
 import sys
@@ -378,6 +380,17 @@ class FnRewriter(ast.NodeTransformer):
         if is_transform_root:
             # If we didn't clear, decorators would be applied twice - screwing up routing handling in libraries like `quart`: `@app.post("/generate")`
             node.decorator_list = []
+        else:
+            # Handle nested @xray calls (e.g. running via `xpy` - everything inside has already been transformed but there won't be source code)
+            for dec in node.decorator_list:
+                match dec:
+                    case ast.Call(func=ast.Name(id="maxray" | "xray")):
+                        dec.keywords.append(
+                            ast.keyword(
+                                "assume_transformed",
+                                value=ast.Constant(True),
+                            )
+                        )
 
         # Removes type annotations from the call for safety as they're evaluated at definition-time rather than call-time
         # Necessary because some packages do `if typing.TYPE_CHECKING` imports
@@ -443,21 +456,6 @@ class FnRewriter(ast.NodeTransformer):
 _TRANSFORM_CACHE = {}
 
 
-def get_fn_name(fn):
-    """
-    Get a printable representation of the function for human-readable errors
-    """
-    if hasattr(fn, "__name__"):
-        name = fn.__name__
-    else:
-        try:
-            name = repr(fn)
-        except Exception:
-            name = f"<unrepresentable function of type {type(fn)}>"
-
-    return f"{name} @ {id(fn)}"
-
-
 def recompile_fn_with_transform(
     source_fn,
     transform_fn,
@@ -471,69 +469,33 @@ def recompile_fn_with_transform(
     """
     Recompiles `source_fn` so that essentially every node of its AST tree is wrapped by a call to `transform_fn` with the evaluated value along with context information about the source code.
     """
+    original_source_fn = source_fn
+    match WithFunction.try_for_transform(source_fn):
+        case Ok((source_fn, with_source_fn)):
+            pass
+        case Err((err, _wf)):
+            return Err(err)
 
-    # Could store as bytes but extra memory insignificant
-    # Even failed transforms should get ids assigned and returned as part of Err for tracking
-    # TODO: assign as field, and use instead of cache?
-    # TODO: hash based on properties so consistent across program runs
-    maxray_assigned_id = str(uuid.uuid4())
-    try:
-        source_fn._MAXRAY_TRANSFORM_ID = maxray_assigned_id
-    except AttributeError:
-        pass
-
-    # TODO: use non-overridable __getattribute__ instead?
-    if not hasattr(source_fn, "__name__"):  # Safety check against weird functions
-        return Err(f"There is no __name__ for function {get_fn_name(source_fn)}")
-
-    if source_fn.__name__ == "<lambda>":
-        return Err("Cannot safely recompile lambda functions")
-
+    source_fn = original_source_fn
     # handle `functools.wraps`
     # TODO: multiple layers of nesting?
     if hasattr(source_fn, "__wrapped__"):
         # SOUNDNESS: failure when decorators aren't applied at the definition site (will look for the original definition, ignoring any transformations that have been applied before the wrap but after definition)
         source_fn = source_fn.__wrapped__
 
-    try:
-        original_source = inspect.getsource(source_fn)
-
-        # nested functions have excess indentation preventing compile; inspect.cleandoc(source) is an alternative but less reliable
-        source = dedent(original_source)
-
-        # want to map back to correct original location
-        dedent_chars = original_source.find("\n") - source.find("\n")
-
-        sourcefile = inspect.getsourcefile(source_fn)
-        module = inspect.getmodule(source_fn)
-
-        # the way numpy implements its array hooks means it does its own voodoo code generation resulting in functions that have source code, but no corresponding source file
-        # e.g. the source file of `np.unique` is <__array_function__ internals>
-        if sourcefile is None or not Path(sourcefile).exists():
-            return Err(
-                f"Non-existent source file ({sourcefile}) for function {get_fn_name(source_fn)}"
-            )
-
-        if module is None:
-            return Err(
-                f"Non-existent source module `{getattr(source_fn, '__module__', None)}` for function {get_fn_name(source_fn)}"
-            )
-
-        fn_ast = ast.parse(source)
-    except OSError:
-        return Err(f"No source code for function {get_fn_name(source_fn)}")
-    except TypeError:
+    module = inspect.getmodule(source_fn)
+    if module is None:
         return Err(
-            f"No source code for probable built-in function {get_fn_name(source_fn)}"
+            f"Non-existent source module `{getattr(source_fn, '__module__', None)}` for function {get_fn_name(source_fn)}"
         )
 
     try:
-        fn_ast = ast.parse(source)
+        fn_ast = ast.parse(with_source_fn.source)
     except SyntaxError:
         return Err(f"Syntax error in function {get_fn_name(source_fn)}")
 
     # TODO: be smarter and look for global/nonlocal statements in the parsed repr instead
-    if "global " in source:
+    if "global " in with_source_fn.source:
         return Err("Cannot safely transform functions containing `global` declarations")
 
     match fn_ast:
@@ -548,16 +510,19 @@ def recompile_fn_with_transform(
     if ast_pre_callback is not None:
         ast_pre_callback(fn_ast)
 
-    fn_is_method = inspect.ismethod(source_fn)
+    # fn_is_method = inspect.ismethod(source_fn)
+    fn_is_method = with_source_fn.method is not None
     if fn_is_method:
+        # parent_cls = with_source_fn.method.instance_cls
+        # parent_cls = with_source_fn.method.instance_cls
         # Many potential unintended side-effects
-        match source_fn.__self__:
+        match original_source_fn.__self__:
             case type():
                 # Descriptor
-                parent_cls = source_fn.__self__
+                parent_cls = original_source_fn.__self__
             case _:
                 # Bound method
-                parent_cls = type(source_fn.__self__)
+                parent_cls = type(original_source_fn.__self__)
 
     # yeah yeah an unbound __init__ isn't actually a method but we can basically treat it as one
     if special_use_instance_type is not None:
@@ -569,8 +534,8 @@ def recompile_fn_with_transform(
         source_fn,
         source_fn.__qualname__,
         module.__name__,
-        source,
-        sourcefile,
+        with_source_fn.source,
+        with_source_fn.source_file,
         fn_call_counter,
     )
     instance_type = parent_cls.__name__ if fn_is_method else None
@@ -578,7 +543,7 @@ def recompile_fn_with_transform(
         transform_fn,
         fn_context,
         instance_type=instance_type,
-        dedent_chars=dedent_chars,
+        dedent_chars=with_source_fn.added_context["dedent_chars"],
         pass_locals_on_return=pass_scope,
         is_maxray_root=is_maxray_root,
     ).visit(fn_ast)
@@ -679,9 +644,9 @@ def recompile_fn_with_transform(
     except Exception as e:
         logger.exception(e)
         logger.error(
-            f"Failed to compile function `{source_fn.__name__}` at '{sourcefile}' in its module {module}"
+            f"Failed to compile function `{source_fn.__name__}` at '{with_source_fn.source_file}' in its module {module}"
         )
-        logger.trace(f"Relevant original source code:\n{source}")
+        logger.trace(f"Relevant original source code:\n{with_source_fn.source}")
         logger.trace(f"Corresponding AST:\n{FnRewriter.safe_show_ast(fn_ast)}")
         logger.trace(
             f"Transformed code we attempted to compile:\n{FnRewriter.safe_unparse(transformed_fn_ast)}"
@@ -693,13 +658,13 @@ def recompile_fn_with_transform(
         file_to_modules = {
             getattr(mod, "__file__", None): mod for mod in sys.modules.values()
         }
-        if sourcefile in file_to_modules:
+        if with_source_fn.source_file in file_to_modules:
             # Re-executing in a different module: re-declare scope without the previous module (otherwise we get incorrect behaviour like `min` being replaced with `np.amin` in `np.load`)
             scope = {
                 **scope_layers["class_local"],
                 **vars(builtins),
                 **scope_layers["core"],
-                **vars(file_to_modules[sourcefile]),
+                **vars(file_to_modules[with_source_fn.source_file]),
                 **scope_layers["closure"],
                 **scope_layers["override"],
             }
@@ -717,11 +682,11 @@ def recompile_fn_with_transform(
             except Exception as e:
                 logger.exception(e)
                 return Err(
-                    f"Re-def of function {get_fn_name(source_fn)} in its source file module at {sourcefile} also failed"
+                    f"Re-def of function {get_fn_name(source_fn)} in its source file module at {with_source_fn.source_file} also failed"
                 )
         else:
             return Err(
-                f"Failed to re-def function {get_fn_name(source_fn)} and its source file {sourcefile} was not found in sys.modules"
+                f"Failed to re-def function {get_fn_name(source_fn)} and its source file {with_source_fn.source_file} was not found in sys.modules"
             )
 
     if fn_is_method:
@@ -742,7 +707,13 @@ def recompile_fn_with_transform(
 
     # way to keep track of which functions we've already transformed
     transformed_fn._MAXRAY_TRANSFORMED = True
-    transformed_fn._MAXRAY_TRANSFORM_ID = maxray_assigned_id
+    transformed_fn._MAXRAY_TRANSFORM_ID = with_source_fn.compiled().compile_id
+
+    # if hasattr(transformed_fn, "__wrapped__"):
+    #     transformed_fn.__wrapped__._MAXRAY_TRANSFORMED = True
+    #     transformed_fn.__wrapped__._MAXRAY_TRANSFORM_ID = (
+    #         with_source_fn.compiled().compile_id
+    #     )
 
     return Ok(transformed_fn)
 
