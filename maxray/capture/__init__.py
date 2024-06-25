@@ -1,1 +1,1 @@
-from .logs_cli import ScriptRunner
+from .logs_cli import ScriptRunner, EndOfScript

@@ -13,6 +13,7 @@ import ast
 from textwrap import indent
 import sys
 import tempfile
+from contextvars import ContextVar
 from typing import Any, Callable, Optional
 from copy import copy
 from dataclasses import dataclass, field
@@ -22,7 +23,12 @@ from types import ModuleType
 from rich.console import Console
 import click
 
+from maxray.transforms import FnContext
+
 console = Console()
+
+
+class EndOfScript: ...
 
 
 def dump_on_exception():
@@ -236,6 +242,24 @@ class ScriptRunner:
             with CaptureLogs() as cl:
                 try:
                     final_scope = fn()
+
+                    # A way to run custom code at the end of a script
+                    self.with_decor_inator(
+                        EndOfScript(),
+                        NodeContext(
+                            "internal/capture",
+                            "EndOfScript()",
+                            FnContext(
+                                EndOfScript.__init__,
+                                "__init__",
+                                "maxray.capture",
+                                "",
+                                "",
+                                ContextVar("maxray_call_counter", default=0),
+                            ),
+                            (0, 0, 0, 0),
+                        ),
+                    )
                 except Exception as e:
                     dump_on_exception()
                     exc = e
