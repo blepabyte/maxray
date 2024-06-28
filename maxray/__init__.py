@@ -66,6 +66,8 @@ _GLOBAL_SKIP_MODULES = {
     "re",  # internals of regexp have a lot of uninteresting step methods
     "copy",  # pytorch spends so much time in here
     "functools",  # partialmethod causes mis-bound `self` in TQDM
+    "asyncio",  # AttributeError: 'NoneType' object has no attribute 'new_event_loop'
+    "logging",  # global _loggerClass probably causes problems
     "typing",
     "importlib",
     "ctypes",
@@ -137,6 +139,9 @@ def instance_init_allowed_for_transform(x, ctx: NodeContext):
     """
     Decides whether the __init__ method can be transformed.
     """
+    if getattr(x, "__module__", None) in _GLOBAL_SKIP_MODULES:
+        return False
+
     return (
         type(x) is type
         and getattr(x, "__module__", None) not in {"ctypes"}
@@ -200,6 +205,7 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                     # NOTE: x_trans now has _MAXRAY_TRANSFORMED field to True
                     with_fn = FunctionStore.get(x_trans._MAXRAY_TRANSFORM_ID)
 
+                    # This does not apply when accessing X.method - only X().method
                     if inspect.ismethod(x):
                         # if with_fn.method is not None:
                         # Two cases: descriptor vs bound method
@@ -326,9 +332,8 @@ def maxray(
                 case Ok(fn_transform):
                     pass
                 case Err(err):
-                    # Errors are only displayed at top-level, when the user has manually annotated a function with @xray or the like
-                    logger.error(err)
-                    return fn
+                    # Do not allow silently failing if a function has been explicitly annotated with @xray or the like
+                    raise RuntimeError(f"{err}: Failed to transform {fn}")
 
         # BUG: We can't do @wraps if it's a callable instance, right?
         if inspect.iscoroutinefunction(fn):

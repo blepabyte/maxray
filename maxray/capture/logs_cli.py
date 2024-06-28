@@ -218,12 +218,13 @@ class ScriptRunner:
             mode="exec",
         )
 
-        namespace = {}
+        # internals require module to be valid for transform to go ahead
+        exec_in_module = self.run_type.in_module()
+
+        namespace = exec_in_module.__dict__
         exec(compiled_code, namespace)
         main = namespace[self.MAIN_FN_NAME]
 
-        # internals require module to be valid for transform to go ahead
-        exec_in_module = self.run_type.in_module()
         sys.modules[exec_in_module.__name__] = exec_in_module
         main.__module__ = exec_in_module.__name__
         return main
@@ -266,6 +267,8 @@ class ScriptRunner:
                     exc = e
                     final_scope = {}
 
+        except KeyboardInterrupt:
+            pass
         finally:
             sys.path = prev_sys_path
 
@@ -432,14 +435,23 @@ def cli(
     _result = wrapper.run()
 
     if capture is not None:
-        ft.write_feather(_result.logs_arrow, capture)
+        capture_to = Path(capture)
+        ft.write_feather(_result.logs_arrow, str(capture_to))
+        ft.write_feather(
+            _result.functions_arrow,
+            str(capture_to.with_stem(capture_to.stem + "-functions")),
+        )
     elif capture_default:
+        capture_to = (
+            Path(run.sourcemap_to()).resolve(True).parent / _DEFAULT_CAPTURE_LOGS_NAME
+        )
         ft.write_feather(
             _result.logs_arrow,
-            str(
-                Path(run.sourcemap_to()).resolve(True).parent
-                / _DEFAULT_CAPTURE_LOGS_NAME
-            ),
+            str(capture_to),
+        )
+        ft.write_feather(
+            _result.functions_arrow,
+            str(capture_to.with_stem(capture_to.stem + "-functions")),
         )
 
 

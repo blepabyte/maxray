@@ -34,7 +34,7 @@ def unmangle_name(identifier):
 @dataclass
 class FnContext:
     impl_fn: Callable
-    name: str
+    name: str  # qualname
     module: str
     source: str
     source_file: str
@@ -114,6 +114,7 @@ class FnRewriter(ast.NodeTransformer):
 
         # the first `def` we encounter is the one that we're transforming. Subsequent ones will be nested/within class definitions.
         self.fn_count = 0
+        self.known_globals_stack = []
 
     def is_method(self):
         return self.instance_type is not None
@@ -208,10 +209,26 @@ class FnRewriter(ast.NodeTransformer):
         match node.ctx:
             case ast.Load():
                 # Variable is accessed
-                new_node = self.generic_visit(node)
+                if node.id in self.known_globals_stack[-1]:
+                    new_node = ast.fix_missing_locations(
+                        ast.Subscript(
+                            value=ast.Name(id="_MAXRAY_MODULE_GLOBALS", ctx=ast.Load()),
+                            slice=ast.Constant(node.id),
+                            ctx=ast.Load(),
+                        )
+                    )
+                else:
+                    new_node = node
             case ast.Store():
                 # Variable is assigned to
-                return node
+                if node.id in self.known_globals_stack[-1]:
+                    return ast.Subscript(
+                        value=ast.Name(id="_MAXRAY_MODULE_GLOBALS", ctx=ast.Load()),
+                        slice=ast.Constant(node.id),
+                        ctx=ast.Store(),
+                    )
+                else:
+                    return node
             case _:
                 logger.error(f"Unknown context {node.ctx}")
                 return node
@@ -228,8 +245,14 @@ class FnRewriter(ast.NodeTransformer):
         source_pre = self.recover_source(node)
         node = deepcopy(node)
 
-        if self.is_method() and self.is_private_class_name(node.attr):
-            node.attr = f"_{self.instance_type}{node.attr}"
+        # if self.is_method() and self.is_private_class_name(node.attr):
+        if self.is_private_class_name(node.attr):
+            # currently we do a bad job of actually checking if it's supposed to be a method-like so this is just a hopeful guess
+            qualname_type_guess = self.fn_context.name.split(".")[-2]
+            if self.instance_type is not None:
+                node.attr = f"_{self.instance_type}{node.attr}"
+            else:
+                node.attr = f"_{qualname_type_guess}{node.attr}"
             logger.warning("Replaced with mangled private name")
 
         if isinstance(node.ctx, ast.Load):
@@ -365,7 +388,9 @@ class FnRewriter(ast.NodeTransformer):
             node_pre,
         )
 
-    def visit_FunctionDef(self, node: ast.FunctionDef):
+    def transform_function_def(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
+        self.known_globals_stack.append(set())
+
         pre_node = deepcopy(node)
         node = deepcopy(node)
         self.fn_count += 1
@@ -415,42 +440,20 @@ class FnRewriter(ast.NodeTransformer):
                 )
             )
 
+        self.known_globals_stack.pop()
         return out
+
+    def visit_Global(self, node: ast.Global):
+        # global declaration only applies at immediate function def level
+        self.known_globals_stack[-1].update(node.names)
+        return ast.fix_missing_locations(ast.Expr(ast.Constant(None)))
+        # return self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        return self.transform_function_def(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
-        """
-        Copied directly from FunctionDef
-        TODO: FIX OR REFACTOR
-        """
-
-        pre_node = deepcopy(node)
-
-        self.fn_count += 1
-        # Only overwrite the name of our "target function"
-        if self.fn_count == 1 and self.is_method():
-            node.name = f"{node.name}_{self.instance_type}_{node.name}"
-
-        is_transform_root = self.fn_count == 1 and any(
-            isinstance(decor, ast.Call)
-            and isinstance(decor.func, ast.Name)
-            and decor.func.id in {"maxray", "xray", "transform"}
-            for decor in node.decorator_list
-        )
-
-        if is_transform_root:
-            logger.debug(
-                f"Wiped decorators at level {self.fn_count} for {self.fn_context.impl_fn}: {node.decorator_list}"
-            )
-            self.fn_count += 1
-            node.decorator_list = []
-
-        # Removes type annotations from the call for safety as they're evaluated at definition-time rather than call-time
-        # This may not be needed now that locals are (usually) captured properly
-        for arg in node.args.args:
-            arg.annotation = None
-
-        out = ast.copy_location(self.generic_visit(node), pre_node)
-        return out
+        return self.transform_function_def(node)
 
 
 _TRANSFORM_CACHE = {}
@@ -494,9 +497,7 @@ def recompile_fn_with_transform(
     except SyntaxError:
         return Err(f"Syntax error in function {get_fn_name(source_fn)}")
 
-    # TODO: be smarter and look for global/nonlocal statements in the parsed repr instead
-    if "global " in with_source_fn.source:
-        return Err("Cannot safely transform functions containing `global` declarations")
+    # TODO: warn on "nonlocal" statements?
 
     match fn_ast:
         case ast.Module(body=[ast.FunctionDef() | ast.AsyncFunctionDef()]):
@@ -571,6 +572,9 @@ def recompile_fn_with_transform(
             "_MAXRAY_DECORATE_WITH_COUNTER": count_calls_with,
             "_MAXRAY_BUILTINS_LOCALS": locals,
             "_MAXRAY_PATCH_MRO": patch_mro,
+            "_MAXRAY_MODULE_GLOBALS": vars(
+                module
+            ),  # TODO: on fail need to use different module
         },
         "override": override_scope,
         "class_local": {},
@@ -636,7 +640,9 @@ def recompile_fn_with_transform(
 
         exec(
             compile(
-                transformed_fn_ast, filename=f"<{source_fn.__name__}>", mode="exec"
+                transformed_fn_ast,
+                filename=f"<{source_fn.__name__} in {with_source_fn.source_file}>",
+                mode="exec",
             ),
             scope,
             scope,
