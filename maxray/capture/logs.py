@@ -139,9 +139,13 @@ class CaptureLogs:
             logger.warning("Nothing to flush")
             return
 
+        # Because script may have been KeyboardInterrupt/SIGINT'd at any point, array lengths aren't guaranteed to be the same
+        truncate_len = min(len(arr) for arr in self.builders.values())
+
         arrays, names = [], []
         for col_name, col_type in self.type_schema.items():
             builder = self.builders[col_name]
+            # builder = self.builders[col_name][:truncate_len] # blows up size +1GB memory / second
             arrays.append(pa.array(builder, type=col_type))
             names.append(col_name)
 

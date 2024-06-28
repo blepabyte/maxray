@@ -170,7 +170,10 @@ def _maxray_walker_handler(x, ctx: NodeContext):
     # 1a. special-case callables: __init__ and __call__
     if instance_init_allowed_for_transform(x, ctx):
         match recompile_fn_with_transform(
-            x.__init__, _maxray_walker_handler, special_use_instance_type=x
+            x.__init__,
+            _maxray_walker_handler,
+            special_use_instance_type=x,
+            triggered_by_node=ctx,
         ):
             case Ok(init_patch):
                 logger.debug(f"Patching __init__ for class {x}")
@@ -181,7 +184,10 @@ def _maxray_walker_handler(x, ctx: NodeContext):
 
     elif instance_call_allowed_for_transform(x, ctx):
         match recompile_fn_with_transform(
-            x.__call__, _maxray_walker_handler, special_use_instance_type=x
+            x.__call__,
+            _maxray_walker_handler,
+            special_use_instance_type=x,
+            triggered_by_node=ctx,
         ):
             case Ok(call_patch):
                 logger.debug(f"Patching __call__ for class {x}")
@@ -200,7 +206,9 @@ def _maxray_walker_handler(x, ctx: NodeContext):
             # user-defined filters for which nodes (not) to descend into
             pass
         else:
-            match recompile_fn_with_transform(x, _maxray_walker_handler):
+            match recompile_fn_with_transform(
+                x, _maxray_walker_handler, triggered_by_node=ctx
+            ):
                 case Ok(x_trans):
                     # NOTE: x_trans now has _MAXRAY_TRANSFORMED field to True
                     with_fn = FunctionStore.get(x_trans._MAXRAY_TRANSFORM_ID)

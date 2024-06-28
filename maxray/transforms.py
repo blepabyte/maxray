@@ -1,4 +1,4 @@
-from .function_store import WithFunction, get_fn_name
+from .function_store import WithFunction, prepare_function_for_transform, get_fn_name
 
 import ast
 import inspect
@@ -15,7 +15,7 @@ from result import Result, Ok, Err
 from contextvars import ContextVar
 from functools import wraps
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from loguru import logger
 
@@ -39,6 +39,7 @@ class FnContext:
     source: str
     source_file: str
     call_count: ContextVar[int]
+    compile_id: str
 
     def __repr__(self):
         # Call count not included in repr so the same source location can be "grouped by" over multiple calls
@@ -468,16 +469,22 @@ def recompile_fn_with_transform(
     pass_scope=False,
     special_use_instance_type=None,
     is_maxray_root=False,
+    triggered_by_node: Optional[NodeContext] = None,
 ) -> Result[Callable, str]:
     """
     Recompiles `source_fn` so that essentially every node of its AST tree is wrapped by a call to `transform_fn` with the evaluated value along with context information about the source code.
     """
     original_source_fn = source_fn
-    match WithFunction.try_for_transform(source_fn):
-        case Ok((source_fn, with_source_fn)):
+    match prepare_function_for_transform(source_fn, from_ctx=triggered_by_node):
+        case Ok(with_source_fn):
             pass
-        case Err((err, _wf)):
+        case Err(err):
             return Err(err)
+    # match WithFunction.try_for_transform(source_fn):
+    #     case Ok((source_fn, with_source_fn)):
+    #         pass
+    #     case Err((err, _wf)):
+    #         return Err(err)
 
     source_fn = original_source_fn
     # handle `functools.wraps`
@@ -488,14 +495,16 @@ def recompile_fn_with_transform(
 
     module = inspect.getmodule(source_fn)
     if module is None:
-        return Err(
+        return with_source_fn.mark_errored(
             f"Non-existent source module `{getattr(source_fn, '__module__', None)}` for function {get_fn_name(source_fn)}"
         )
 
     try:
         fn_ast = ast.parse(with_source_fn.source)
     except SyntaxError:
-        return Err(f"Syntax error in function {get_fn_name(source_fn)}")
+        return with_source_fn.mark_errored(
+            f"Syntax error in function {get_fn_name(source_fn)}"
+        )
 
     # TODO: warn on "nonlocal" statements?
 
@@ -504,15 +513,15 @@ def recompile_fn_with_transform(
             # Good
             pass
         case _:
-            return Err(
+            return with_source_fn.mark_errored(
                 f"The targeted function {get_fn_name(source_fn)} does not correspond to a single `def` block so cannot be transformed safely!"
             )
 
     if ast_pre_callback is not None:
         ast_pre_callback(fn_ast)
 
-    # fn_is_method = inspect.ismethod(source_fn)
-    fn_is_method = with_source_fn.method is not None
+    fn_is_method = with_source_fn.method_info.is_inspect_method
+    # fn_is_method = with_source_fn.method.is_inspect_method is not None
     if fn_is_method:
         # parent_cls = with_source_fn.method.instance_cls
         # parent_cls = with_source_fn.method.instance_cls
@@ -538,13 +547,15 @@ def recompile_fn_with_transform(
         with_source_fn.source,
         with_source_fn.source_file,
         fn_call_counter,
+        compile_id=with_source_fn.compile_id,
     )
     instance_type = parent_cls.__name__ if fn_is_method else None
     transformed_fn_ast = FnRewriter(
         transform_fn,
         fn_context,
         instance_type=instance_type,
-        dedent_chars=with_source_fn.added_context["dedent_chars"],
+        dedent_chars=with_source_fn.source_dedent_chars,
+        # dedent_chars=with_source_fn.added_context["dedent_chars"],
         pass_locals_on_return=pass_scope,
         is_maxray_root=is_maxray_root,
     ).visit(fn_ast)
@@ -687,11 +698,11 @@ def recompile_fn_with_transform(
                 )
             except Exception as e:
                 logger.exception(e)
-                return Err(
+                return with_source_fn.mark_errored(
                     f"Re-def of function {get_fn_name(source_fn)} in its source file module at {with_source_fn.source_file} also failed"
                 )
         else:
-            return Err(
+            return with_source_fn.mark_errored(
                 f"Failed to re-def function {get_fn_name(source_fn)} and its source file {with_source_fn.source_file} was not found in sys.modules"
             )
 
@@ -704,7 +715,7 @@ def recompile_fn_with_transform(
 
     # a decorator doesn't actually have to return a function! (could be used solely for side effect) e.g. `@register_backend_lookup_factory` for `find_content_backend` in `awkward/contents/content.py`
     if not callable(transformed_fn) and not inspect.ismethoddescriptor(transformed_fn):
-        return Err(
+        return with_source_fn.mark_errored(
             f"Resulting transform of definition of {get_fn_name(source_fn)} is not even callable (got {transform_fn}). Perhaps a decorator that returns None?"
         )
 
@@ -713,7 +724,8 @@ def recompile_fn_with_transform(
 
     # way to keep track of which functions we've already transformed
     transformed_fn._MAXRAY_TRANSFORMED = True
-    transformed_fn._MAXRAY_TRANSFORM_ID = with_source_fn.compiled().compile_id
+    transformed_fn._MAXRAY_TRANSFORM_ID = with_source_fn.compile_id
+    with_source_fn.mark_compiled(transformed_fn)
 
     # if hasattr(transformed_fn, "__wrapped__"):
     #     transformed_fn.__wrapped__._MAXRAY_TRANSFORMED = True
