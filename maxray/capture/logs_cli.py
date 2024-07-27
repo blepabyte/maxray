@@ -1,11 +1,13 @@
 from maxray import maxray, NodeContext
 from maxray.capture.logs import CaptureLogs
+from maxray.capture.exec_sources import ExecSource, DynamicSymbol
 from maxray.function_store import FunctionStore
 
 import pyarrow.compute as pc
 import pyarrow.feather as ft
 import watchfiles
 
+import itertools
 import threading
 import importlib
 import importlib.util
@@ -32,8 +34,16 @@ console = Console()
 class EndOfScript: ...
 
 
+# Should not be caught by any user code
+class AbortRun(BaseException): ...
+
+
+# Should not be caught by any user code
+class Quit(BaseException): ...
+
+
 def dump_on_exception():
-    console.print_exception(show_locals=True, suppress=["maxray"])
+    console.print_exception(show_locals=True, suppress=["maxray"], max_frames=1)
 
 
 def empty_module(module_name: str):
@@ -57,10 +67,40 @@ def set_event():
     return event
 
 
+def watch_files(file_paths):
+    """
+    Watches a set of file paths for changes.
+
+    Needed because `watchfiles` (inotify backend) watches file *inodes*, so the watch is lost when the file gets deleted (e.g. on save and rewrite from most text editors)
+
+    Args:
+        file_paths: Any iterable of `PathLike`s to existing files to be watched for changes.
+
+    Yields:
+        Exact subsets of `file_paths` receiving at least one change event since the last iteration.
+
+        Change types (added, modified, deleted) are discarded because they're unreliable/non-synchronised anyway.
+
+    Notes:
+        Includes debouncing of 50ms.
+    """
+    canon_file_map = {str(Path(p).resolve(True)): p for p in file_paths}
+    containing_dirs = list({str(Path(p).parent.resolve()) for p in file_paths})
+
+    for changes in watchfiles.watch(
+        *containing_dirs, recursive=False, step=50, debounce=1000
+    ):
+        changed_files = (
+            # Can't do strict resolve here because it might not exist
+            canon_file_map.get(str(Path(c[1]).resolve()), None)
+            for c in changes
+        )
+        yield set(filter(bool, changed_files))
+
+
 @dataclass
 class WatchHook:
-    watch_file: str
-    watch_symbol: str
+    watched: DynamicSymbol
     last_inator: Callable = lambda x, ctx: x
     needs_reload: threading.Event = field(default_factory=set_event)
 
@@ -69,16 +109,20 @@ class WatchHook:
         self.needs_reload.wait()
         return self.call_latest(x, ctx)
 
+    def require_reload(self):
+        self.needs_reload.set()
+
     def call_latest(self, x, ctx: NodeContext):
         # Lazily import only when actually called
         if self.needs_reload.is_set():
-            from_module = importfile(self.watch_file)
-            self.last_inator = getattr(from_module, self.watch_symbol)
+            self.last_inator = self.watched.load()
             self.needs_reload.clear()
         return self.last_inator(x, ctx)
 
     def check_and_update(self, changed_files):
-        if not self.needs_reload.is_set() and self.watch_file in changed_files:
+        if not self.needs_reload.is_set() and self.watched.is_changed_by_files(
+            changed_files
+        ):
             self.needs_reload.set()
 
     @staticmethod
@@ -86,10 +130,50 @@ class WatchHook:
         """
         Watch spec of `foo.py:some_fn` means `some_fn` will be imported from `foo.py`, and reloaded every time that file is changed
         """
-        dyn_code_file, watcher_symbol = watch_spec.rsplit(":", maxsplit=1)
-        dyn_code_path = Path(dyn_code_file).resolve(True)
-        assert dyn_code_path.suffix == ".py"
-        return WatchHook(str(dyn_code_path), watcher_symbol)
+        return WatchHook(DynamicSymbol.from_spec(watch_spec, "maxray.inators").unwrap())
+
+
+@dataclass
+class InstanceWatchHook:
+    watched: DynamicSymbol
+    state_instance: Optional[Callable] = None
+    needs_reload: threading.Event = field(default_factory=set_event)
+
+    def block_call_until_updated(self, x, ctx: NodeContext):
+        self.needs_reload.clear()
+        self.needs_reload.wait()
+        return self.call_latest(x, ctx)
+
+    def require_reload(self):
+        self.needs_reload.set()
+        self.state_instance = None
+
+    def call_latest(self, x, ctx: NodeContext):
+        # Lazily import only when actually called
+        if self.state_instance is None or self.needs_reload.is_set():
+            state_type = self.watched.load()
+            if self.state_instance is None:
+                self.state_instance = state_type()
+            else:
+                # Monkey-patch to preserve state between hot reloads
+                self.state_instance.__class__ = state_type
+            self.needs_reload.clear()
+        return self.state_instance(x, ctx)
+
+    def check_and_update(self, changed_files):
+        if not self.needs_reload.is_set() and self.watched.is_changed_by_files(
+            changed_files
+        ):
+            self.needs_reload.set()
+
+    @staticmethod
+    def build(watch_spec: str):
+        """
+        Watch spec of `foo.py:some_fn` means `some_fn` will be imported from `foo.py`, and reloaded every time that file is changed
+        """
+        return InstanceWatchHook(
+            DynamicSymbol.from_spec(watch_spec, "maxray.inators").unwrap()
+        )
 
 
 class ScriptFromFile:
@@ -180,6 +264,7 @@ class ScriptRunner:
     MAIN_FN_NAME = "maaaaaaaaaaaaaaaaaaaaaaaaaaaain"
 
     run_type: ScriptFromFile | ScriptFromString | ScriptFromModule
+    enable_capture: bool = True
     with_decor_inator: Callable = lambda x, ctx: x
     temp_sourcefile: Any = field(
         default_factory=lambda: tempfile.NamedTemporaryFile("w", delete=False)
@@ -237,14 +322,22 @@ class ScriptRunner:
         exc = None
         final_scope = {}
         try:
-            fn = maxray(self.rewrite_node, initial_scope={"__name__": "__main__"})(
-                self.compile_to_callable()
-            )
+            fn = maxray(
+                self.rewrite_node,
+                initial_scope={
+                    "__name__": "__main__",
+                    "__file__": self.run_type.sourcemap_to(),
+                },
+            )(self.compile_to_callable())
 
             with CaptureLogs() as cl:
                 try:
                     final_scope = fn()
 
+                except Exception as e:
+                    dump_on_exception()
+                    exc = e
+                finally:
                     # A way to run custom code at the end of a script
                     self.with_decor_inator(
                         EndOfScript(),
@@ -257,19 +350,23 @@ class ScriptRunner:
                                 "maxray.capture",
                                 "",
                                 "",
+                                0,
                                 call_count=ContextVar("maxray_call_counter", default=0),
                                 compile_id="00000000-0000-0000-0000-000000000000",
                             ),
                             (0, 0, 0, 0),
                         ),
                     )
-                except Exception as e:
-                    dump_on_exception()
-                    exc = e
-                    final_scope = {}
-
-        except KeyboardInterrupt:
+        except (AbortRun, Quit):
+            # this is the only way to quit the run as `exit` will not work
+            raise
+        except SystemExit:
+            # click gives us no choice because it *insists* on stealing KeyboardInterrupt even in standalone mode and throwing SystemExit
             pass
+        except:  # IDGAF just quit
+            # Hide stupidly long stack trace on exit (BdbQuit)
+            # TODO: Handle properly
+            exit(1)
         finally:
             sys.path = prev_sys_path
 
@@ -288,11 +385,14 @@ class ScriptRunner:
         return ScriptOutput(cl.collect(), functions_table, exc, final_scope)
 
     def rewrite_node(self, x, ctx: NodeContext):
-        # functions and contextvars can't be deepcopied
-        ctx = copy(ctx)
-        ctx.fn_context = copy(ctx.fn_context)
-
         if ctx.fn_context.source_file == self.temp_sourcefile.name:
+            # copy if needed to prevent mutation
+
+            ctx = copy(ctx)
+            ctx.fn_context = copy(
+                ctx.fn_context
+            )  # functions and contextvars can't be deepcopied
+
             ctx.fn_context.source_file = self.run_type.sourcemap_to()
 
             # subtract the "def" line and new indentation
@@ -303,7 +403,8 @@ class ScriptRunner:
                 ctx.location[3] - 4,
             )
 
-        CaptureLogs.extractor(x, ctx)
+        if self.enable_capture:
+            CaptureLogs.extractor(x, ctx)
 
         x = self.with_decor_inator(x, ctx)
 
@@ -317,14 +418,13 @@ class InteractiveRunner:
 
     def __init__(
         self,
-        run_type: ScriptFromFile | ScriptFromString | ScriptFromModule,
+        runner: ScriptRunner,
         watch_hooks: list[WatchHook],
         loop: bool = False,
     ):
-        self.run_type = run_type
-        self.runner = ScriptRunner(
-            self.run_type, with_decor_inator=self.apply_interactive_inators
-        )
+        self.runner = runner
+        self.runner.with_decor_inator = self.apply_interactive_inators
+        self.run_type = self.runner.run_type
 
         self.watch_hooks = watch_hooks
         self.loop = loop
@@ -338,13 +438,23 @@ class InteractiveRunner:
         watcher.start()
 
         while True:
+            for hook in self.watch_hooks:
+                hook.require_reload()
             # Exceptions are absorbed into the run output
-            result = self.runner.run()
+            try:
+                result = self.runner.run()
 
-            if not self.loop:
-                return result
+                if not self.loop:
+                    return result
+            except Quit:
+                exit(1)
 
-            print("\n" * 3)
+            except AbortRun:
+                console.log("[bold red]Run aborted (no results saved).")
+                if not self.loop:
+                    exit(1)
+
+            print("\n" * 2)
             with console.status(
                 "Iteration in --loop mode completed: [bold green]Watching for source file changes..."
             ) as _status:
@@ -355,7 +465,11 @@ class InteractiveRunner:
         """
         Wait until either the script file or one of the watched files is modified.
         """
-        files_to_watch = [hook.watch_file for hook in self.watch_hooks]
+        files_to_watch = list(
+            itertools.chain.from_iterable(
+                hook.watched.files_to_watch() for hook in self.watch_hooks
+            )
+        )
         if (source_file := self.run_type.sourcemap_to()) is not None:
             files_to_watch.append(source_file)
 
@@ -364,10 +478,16 @@ class InteractiveRunner:
 
     def watch_loop(self):
         # Support multiple scripts, each of which can be hot-reloaded individually
-        files = [Path(hook.watch_file) for hook in self.watch_hooks]
+        files = list(
+            itertools.chain.from_iterable(
+                hook.watched.files_to_watch() for hook in self.watch_hooks
+            )
+        )
 
-        for change in watchfiles.watch(*files):
-            changed_files = set([str(change[1]) for change in change])
+        # for change in watchfiles.watch(
+        #     *files, debug=True, force_polling=False, rust_timeout=100
+        # ):
+        for changed_files in watch_files(files):
             for hook in self.watch_hooks:
                 hook.check_and_update(changed_files)
 
@@ -375,15 +495,25 @@ class InteractiveRunner:
         for hook in self.watch_hooks:
             try:
                 x = hook.call_latest(x, ctx)
-            except Exception:
-                dump_on_exception()
+            except (AbortRun, Quit):
+                raise
+            except Exception as err:
+                if not isinstance(err, NotImplementedError):
+                    dump_on_exception()
+                else:
+                    console.print("[red]NotImplemented")
 
                 while True:
                     try:
                         x = hook.block_call_until_updated(x, ctx)
                         break
-                    except Exception:
-                        dump_on_exception()
+                    except (AbortRun, Quit):
+                        raise
+                    except Exception as err:
+                        if not isinstance(err, NotImplementedError):
+                            dump_on_exception()
+                        else:
+                            console.print("[red]NotImplemented")
         return x
 
 
@@ -395,6 +525,7 @@ _DEFAULT_CAPTURE_LOGS_NAME = ".maxray-logs.arrow"
 )
 @click.argument("script", type=str)
 @click.option("-w", "--watch", type=str, multiple=True)
+@click.option("-W", "--watch-instance", type=str, multiple=True)
 @click.option("-m", "--module", is_flag=True)
 @click.option(
     "-c",
@@ -414,6 +545,7 @@ def cli(
     script: str,
     module: bool,
     watch: tuple,
+    watch_instance: tuple,
     loop: bool,
     capture_default: bool,
     capture: Optional[str],
@@ -427,13 +559,21 @@ def cli(
     else:
         run = ScriptFromFile(script)
 
-    if not watch:
-        wrapper = ScriptRunner(run)
-    else:
-        hooks = [WatchHook.build(spec) for spec in watch]
-        wrapper = InteractiveRunner(run, hooks, loop=loop)
+    hooks = []
+    if watch:
+        hooks.extend(WatchHook.build(spec) for spec in watch)
+    if watch_instance:
+        hooks.extend(InstanceWatchHook.build(spec) for spec in watch_instance)
 
-    _result = wrapper.run()
+    run_wrapper = ScriptRunner(
+        run, enable_capture=(capture is not None) or capture_default
+    )
+
+    as_interactive = len(hooks) > 0 or loop
+    if as_interactive:
+        run_wrapper = InteractiveRunner(run_wrapper, hooks, loop=loop)
+
+    _result = run_wrapper.run()
 
     if capture is not None:
         capture_to = Path(capture)
@@ -457,4 +597,4 @@ def cli(
 
 
 def run_script():
-    cli()
+    cli.main(standalone_mode=False)

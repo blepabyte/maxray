@@ -17,10 +17,33 @@ from loguru import logger
 class CaptureLogs:
     instance = ContextVar("CaptureLogs")
 
+    ARROW_SCHEMA_FIELDS = {
+        # Source location
+        "loc_line_start": pa.int32(),
+        "loc_line_end": pa.int32(),
+        "loc_col_start": pa.int32(),
+        "loc_col_end": pa.int32(),
+        # Function calls
+        "context_call_id": pa.string(),
+        "target_call_id": pa.string(),
+        "fn": pa.string(),
+        "fn_call_count": pa.int32(),
+        # Source info/code
+        "source_file": pa.string(),
+        "source_module": pa.string(),
+        "source": pa.string(),
+        # Extracted data
+        "struct_repr": pa.string(),
+        "lsp_repr": pa.string(),
+        "value_type": pa.string(),
+        "timestamp": pa.float64(),
+    }
+
     LSP_NO_SHOW_TYPES = {
         "type",
         "function",
         "builtin_function_or_method",
+        "cython_function_or_method",
         "staticmethod",
         "method",
         "module",
@@ -38,18 +61,15 @@ class CaptureLogs:
             if ctx.caller_id is not None:
                 instance.fn_sources[ctx.caller_id] = ctx.fn_context
             if ctx.source != "self":
-                parent_fn_id = getattr(
-                    ctx.fn_context.impl_fn, "_MAXRAY_TRANSFORM_ID", None
-                )
-
                 instance.builder("loc_line_start").append(ctx.location[0])
                 instance.builder("loc_line_end").append(ctx.location[1])
                 instance.builder("loc_col_start").append(ctx.location[2])
                 instance.builder("loc_col_end").append(ctx.location[3])
 
-                instance.builder("caller_id").append(parent_fn_id)
-                instance.builder("callee_id").append(ctx.caller_id)
+                instance.builder("context_call_id").append(ctx.fn_context.compile_id)
+                instance.builder("target_call_id").append(ctx.caller_id)
                 instance.builder("source_file").append(ctx.fn_context.source_file)
+                instance.builder("source_module").append(ctx.fn_context.module)
                 instance.builder("source").append(ctx.source)
 
                 instance.builder("fn").append(ctx.fn_context.name)
@@ -79,32 +99,17 @@ class CaptureLogs:
 
         return x
 
+    @staticmethod
+    def schema():
+        return pa.schema(
+            [pa.field(k, v) for k, v in CaptureLogs.ARROW_SCHEMA_FIELDS.items()]
+        )
+
     def __init__(self, stream_to_arrow_file=None, flush_every_records: int = 10_000):
         # Maps function UUIDs (_MAXRAY_TRANSFORM_ID) to FnContext instances
         self.fn_sources = {}
 
         self.builders = {}
-
-        self.type_schema = {
-            # Source location
-            "loc_line_start": pa.int32(),
-            "loc_line_end": pa.int32(),
-            "loc_col_start": pa.int32(),
-            "loc_col_end": pa.int32(),
-            # Function calls
-            "caller_id": pa.string(),
-            "callee_id": pa.string(),
-            "fn": pa.string(),
-            "fn_call_count": pa.int32(),
-            # Source info/code
-            "source_file": pa.string(),
-            "source": pa.string(),
-            # Extracted data
-            "struct_repr": pa.string(),
-            "lsp_repr": pa.string(),
-            "value_type": pa.string(),
-            "timestamp": pa.float64(),
-        }
 
         if stream_to_arrow_file is not None:
             stream_to_arrow_file = Path(stream_to_arrow_file)
@@ -125,9 +130,6 @@ class CaptureLogs:
 
         self.write_context = ExitStack()
 
-    def schema(self):
-        return pa.schema([pa.field(k, v) for k, v in self.type_schema.items()])
-
     def builder(self, name: str):
         if name not in self.builders:
             self.builders[name] = []
@@ -143,7 +145,7 @@ class CaptureLogs:
         truncate_len = min(len(arr) for arr in self.builders.values())
 
         arrays, names = [], []
-        for col_name, col_type in self.type_schema.items():
+        for col_name, col_type in self.ARROW_SCHEMA_FIELDS.items():
             builder = self.builders[col_name]
             # builder = self.builders[col_name][:truncate_len] # blows up size +1GB memory / second
             arrays.append(pa.array(builder, type=col_type))
