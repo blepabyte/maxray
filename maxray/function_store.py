@@ -14,11 +14,37 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-def set_property_on_functionlike(fn, name: str, value: Any):
+method_wrapper = type(object().__init__)
+wrapper_descriptor = type(object.__init__)
+builtin_function_or_method = type(locals)
+
+
+def set_property_on_functionlike(fn, name: str, value: Any, recurse_wrappers=True):
     """
     Tries to apply to functions, class descriptors, wrapped decorators, etc.
     """
-    raise NotImplementedError()
+    if isinstance(fn, (method_wrapper, wrapper_descriptor, builtin_function_or_method)):
+        return False
+
+    ok = True
+    # Apply at *all* layers of wrapper
+    if recurse_wrappers and hasattr(fn, "__wrapped__"):
+        ok = ok and set_property_on_functionlike(fn.__wrapped__, name, value)
+
+    try:
+        setattr(fn, name, value)
+        assert not inspect.ismethod(fn)
+    except AttributeError as err:
+        # Apply to underlying method if bound
+        if inspect.ismethod(fn):
+            setattr(fn.__func__, name, value)
+            return ok
+        else:
+            ok = False
+
+            # DEBUG-ONLY
+            raise Exception(f"{type(fn)} - couldn't set: {err}")
+    return ok
 
 
 def get_fn_name(fn):
@@ -46,16 +72,27 @@ class Method:
     def create(fn):
         is_inspect_method = inspect.ismethod(fn)
 
-        if is_inspect_method:
-            if inspect.isclass(fn.__self__):  # classmethod
-                self_cls = fn.__self__
-            else:
-                self_cls = type(fn.__self__)
+        if not is_inspect_method:
+            return Method(False, None, None)
 
-            return Method(True, self_cls, None)
-        return Method(False, None, None)
+        if inspect.isclass(fn.__self__):  # classmethod
+            self_cls = fn.__self__
+        else:
+            self_cls = type(fn.__self__)
+
+        qual_parts = fn.__qualname__.split(".")
+        qual_cls_name = qual_parts[-2] if len(qual_parts) >= 2 else None
+        qual_cls = None
+
+        for sup_class in self_cls.mro():
+            if sup_class.__name__ == qual_cls_name:
+                qual_cls = sup_class
+                break
+
+        return Method(True, self_cls, qual_cls)
 
     def to_dict(self):
+        raise NotImplementedError()
         return {
             "instance_cls": self.instance_cls.__name__,
             "defined_on_cls": self.defined_on_cls.__name__,
@@ -68,6 +105,7 @@ class FunctionData:
     qualname: Optional[str]
     module: Optional[str]
     source: Optional[str]
+    source_offset_lines: Optional[int]
     source_dedent_chars: Optional[int]
     source_file: Optional[str]
     method_info: Method
@@ -80,19 +118,26 @@ class FunctionData:
 
     @staticmethod
     def create(fn, from_ctx: Optional["NodeContext"]):
+        if hasattr(fn, "__wrapped__"):
+            # wrappers.append(fn)
+            fn = fn.__wrapped__
+
         name = getattr(fn, "__name__", None)
         qualname = getattr(fn, "__qualname__", None)
         module = getattr(fn, "__module__", None)
 
         dedent_chars = None
         try:
-            original_source = inspect.getsource(fn)
+            # inspect.getsource literally calls getsourcelines and joins
+            original_source_lines, line_offset = inspect.getsourcelines(fn)
+            original_source = "".join(original_source_lines)
             # nested functions have excess indentation preventing compile; inspect.cleandoc(source) is an alternative but less reliable
             source = textwrap.dedent(original_source)
             # used to map source back to correct original location
             dedent_chars = original_source.find("\n") - source.find("\n")
         except (OSError, TypeError):
             source = None
+            line_offset = None
 
         try:
             sourcefile = inspect.getsourcefile(fn)
@@ -111,6 +156,7 @@ class FunctionData:
             qualname=qualname,
             module=module,
             source=source,
+            source_offset_lines=line_offset,
             source_file=sourcefile,
             method_info=Method.create(fn),
             source_dedent_chars=dedent_chars,
@@ -138,7 +184,7 @@ class FunctionData:
         elif not fd.qualname:
             reason = "Missing qualified function name"
         elif not fd.module:
-            reason = "Unable to determine function source module"
+            reason = f"Unable to determine function source module: {fd}"
         elif not fd.source:
             reason = "Unable to find source code of function"
         elif (not fd.source_file) or (not Path(fd.source_file).exists()):
@@ -200,11 +246,7 @@ class ErroredFunction:
 def prepare_function_for_transform(
     fn, from_ctx: Optional["NodeContext"] = None
 ) -> Result[FunctionData, str]:
-    match FunctionData.validate(fn, from_ctx):
-        case Ok(fd):
-            return Ok(fd)
-        case Err(e):
-            return Err(e)
+    return FunctionData.validate(fn, from_ctx)
 
 
 @dataclass
@@ -395,7 +437,7 @@ class FunctionStore:
         self.failures = {}
 
     @staticmethod
-    def get(id) -> WithFunction:
+    def get(id) -> CompiledFunction | ErroredFunction:
         return FunctionStore.instance.functions[id]
 
     @staticmethod
@@ -417,8 +459,9 @@ class FunctionStore:
                     [
                         fn.to_dict()
                         for fn in itertools.chain(
-                            FunctionStore.instance.functions.values(),
-                            FunctionStore.instance.failures.values(),
+                            # RuntimeError: dictionary changed size during iteration
+                            list(FunctionStore.instance.functions.values()),
+                            list(FunctionStore.instance.failures.values()),
                         )
                     ]
                 )

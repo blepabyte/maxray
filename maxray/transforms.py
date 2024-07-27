@@ -1,4 +1,4 @@
-from .function_store import WithFunction, prepare_function_for_transform, get_fn_name
+from .function_store import FunctionData, prepare_function_for_transform, get_fn_name
 
 import ast
 import inspect
@@ -38,6 +38,9 @@ class FnContext:
     module: str
     source: str
     source_file: str
+    line_offset: int
+    "Line number in `source_file` at which the function definition begins."
+
     call_count: ContextVar[int]
     compile_id: str
 
@@ -64,7 +67,7 @@ class NodeContext:
 
     location: tuple[int, int, int, int]
     """
-    (start_line, end_line, start_col, end_col)
+    (start_line, end_line, start_col, end_col) as 0-indexed location of `source` in `fn_context.source_file`
     """
 
     local_scope: Any = None
@@ -301,14 +304,25 @@ class FnRewriter(ast.NodeTransformer):
         return ast.copy_location(node, node_pre)
 
     @staticmethod
-    def temp_binding(node, by_name: str):
-        return ast.fix_missing_locations(
+    def temp_binding(node):
+        """
+        Returns a wrapping node that sets the temporary, and a node to retrieve the last set value.
+        """
+        wrap_node = ast.fix_missing_locations(
             ast.Call(
                 ast.Name("_MAXRAY_SET_TEMP", ctx=ast.Load()),
-                [node, ast.Constant(by_name)],
+                [ast.Name("_MAXRAY_TEMP_LOCAL_VAR", ctx=ast.Load()), node],
                 keywords=[],
             )
         )
+        get_node = ast.fix_missing_locations(
+            ast.Subscript(
+                ast.Name("_MAXRAY_TEMP_LOCAL_VAR", ctx=ast.Load()),
+                slice=ast.Constant(0),
+                ctx=ast.Load(),
+            )
+        )
+        return wrap_node, get_node
         # Cannot use walrus expressions in nested list comprehension context
         # return ast.fix_missing_locations(
         #     ast.Subscript(
@@ -355,8 +369,9 @@ class FnRewriter(ast.NodeTransformer):
 
         node = self.generic_visit(node)  # mutates
         # Want to keep track of which function we're calling
+        # very very not thread-safe...
         # `node.func` is now likely a call to `_maxray_walker_handler`
-        node.func = self.temp_binding(node.func, "_MAXRAY_TEMP_VAR")
+        node.func, node_func_ref = self.temp_binding(node.func)
         # We can't use `node_pre.func` beacuse evaluating it has side effects
 
         # TODO: maybe assign the super() proxy and do the MRO patching at the start of the function
@@ -369,7 +384,7 @@ class FnRewriter(ast.NodeTransformer):
                     value=ast.Call(
                         func=ast.Name("getattr", ctx=ast.Load()),
                         args=[
-                            ast.Name("_MAXRAY_TEMP_VAR", ctx=ast.Load()),
+                            node_func_ref,
                             ast.Constant("_MAXRAY_TRANSFORM_ID"),
                             ast.Constant(None),
                         ],
@@ -428,12 +443,22 @@ class FnRewriter(ast.NodeTransformer):
 
         node.returns = None
 
-        out = ast.copy_location(self.generic_visit(node), pre_node)
+        node.body = [self.visit(stmt) for stmt in node.body]
+        out = node
+        # out = self.generic_visit(node)
+
+        assign_stmt = ast.Assign(
+            targets=[ast.Name(id="_MAXRAY_TEMP_LOCAL_VAR", ctx=ast.Store())],
+            value=ast.List(elts=[ast.Constant(value=None)], ctx=ast.Load()),
+        )
+        out.body.insert(0, assign_stmt)
+
+        out = ast.copy_location(out, pre_node)
 
         # Add statements after visiting so that walk handlers aren't called on this internal code
         if self.fn_count == 1 and self.record_call_counts:
             # has to be applied as a decorator so that inner recursive calls of the fn are tracked properly
-            node.decorator_list.append(
+            out.decorator_list.append(
                 ast.Call(
                     func=ast.Name(id="_MAXRAY_DECORATE_WITH_COUNTER", ctx=ast.Load()),
                     args=[ast.Name(id="_MAXRAY_CALL_COUNTER", ctx=ast.Load())],
@@ -479,6 +504,7 @@ def recompile_fn_with_transform(
         case Ok(with_source_fn):
             pass
         case Err(err):
+            logger.error(err)
             return Err(err)
     # match WithFunction.try_for_transform(source_fn):
     #     case Ok((source_fn, with_source_fn)):
@@ -493,7 +519,8 @@ def recompile_fn_with_transform(
         # SOUNDNESS: failure when decorators aren't applied at the definition site (will look for the original definition, ignoring any transformations that have been applied before the wrap but after definition)
         source_fn = source_fn.__wrapped__
 
-    module = inspect.getmodule(source_fn)
+    module = lookup_module(with_source_fn)
+    # module = inspect.getmodule(source_fn)
     if module is None:
         return with_source_fn.mark_errored(
             f"Non-existent source module `{getattr(source_fn, '__module__', None)}` for function {get_fn_name(source_fn)}"
@@ -534,6 +561,9 @@ def recompile_fn_with_transform(
                 # Bound method
                 parent_cls = type(original_source_fn.__self__)
 
+        if with_source_fn.method_info.defined_on_cls is not None:
+            parent_cls = with_source_fn.method_info.defined_on_cls
+
     # yeah yeah an unbound __init__ isn't actually a method but we can basically treat it as one
     if special_use_instance_type is not None:
         fn_is_method = True
@@ -546,6 +576,7 @@ def recompile_fn_with_transform(
         module.__name__,
         with_source_fn.source,
         with_source_fn.source_file,
+        with_source_fn.source_offset_lines,
         fn_call_counter,
         compile_id=with_source_fn.compile_id,
     )
@@ -594,9 +625,9 @@ def recompile_fn_with_transform(
     }
 
     # BUG: this will NOT work with threading - could use ContextVar if no performance impact?
-    def set_temp(val, name: str):
-        scope[name] = val
-        return val
+    def set_temp(state, value):
+        state[0] = value
+        return value
 
     scope_layers["core"]["_MAXRAY_SET_TEMP"] = set_temp
     # Add class-private names to scope (though only should be usable as a default argument)
@@ -665,7 +696,7 @@ def recompile_fn_with_transform(
         )
         logger.trace(f"Relevant original source code:\n{with_source_fn.source}")
         logger.trace(f"Corresponding AST:\n{FnRewriter.safe_show_ast(fn_ast)}")
-        logger.trace(
+        logger.debug(
             f"Transformed code we attempted to compile:\n{FnRewriter.safe_unparse(transformed_fn_ast)}"
         )
 
@@ -768,3 +799,30 @@ def count_calls_with(counter: ContextVar):
         return fn_with_counter
 
     return inner
+
+
+FILE_TO_SYS_MODULES = {}
+
+
+def lookup_module(fd: FunctionData):
+    if fd.source_file in FILE_TO_SYS_MODULES:
+        return FILE_TO_SYS_MODULES[fd.source_file]
+
+    file_matched = None
+    module_matched = None
+    for module_name, module in sys.modules.items():
+        module_path = getattr(module, "__file__", None)
+
+        if module_path is not None:
+            FILE_TO_SYS_MODULES[module_path] = module
+
+            if module_path == fd.source_file:
+                file_matched = module
+
+        if module_name == fd.module:
+            module_matched = module
+
+    if file_matched:
+        return file_matched
+    else:
+        return module_matched

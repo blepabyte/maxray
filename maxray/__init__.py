@@ -1,5 +1,5 @@
 from .transforms import recompile_fn_with_transform, NodeContext
-from .function_store import FunctionStore
+from .function_store import FunctionStore, set_property_on_functionlike
 
 import inspect
 from weakref import ref, WeakSet
@@ -69,11 +69,15 @@ _GLOBAL_SKIP_MODULES = {
     "asyncio",  # AttributeError: 'NoneType' object has no attribute 'new_event_loop'
     "logging",  # global _loggerClass probably causes problems
     "typing",
+    "ast",
     "importlib",
     "ctypes",
     "loguru",  # used internally in transform - accidental patching will cause inf recursion
     "uuid",  # used for generating _MAXRAY_TRANSFORM_ID
+    "urllib3",
+    "aiohttp",  # something icky about web.RouteTableDef() when route decorated from submodule
     "maxray",
+    "git",
 }
 # TODO: probably just skip the entire Python standard library...
 
@@ -113,8 +117,39 @@ _MAXRAY_FN_CACHE = dict()
 _MAXRAY_FN_FAILED_CACHE = WeakSet()
 
 
-def callable_allowed_for_transform(x, ctx: NodeContext):
+wrapper_descriptor = type(object.__init__)
+method_wrapper = type(type.__call__.__get__(type))
+
+
+def transform_precheck(x, ctx: NodeContext):
+    if not callable(x):
+        return False
+
+    if isinstance(x, type):  # Not a function
+        # Also, we want __getattribute__ to be the bound method for an instance
+        return False
+
+    if isinstance(x, (wrapper_descriptor, method_wrapper)):
+        return False
+
+    try:
+        # Avoid calling getattr since things like DataFrames override it (and cause recursion errors)
+        x.__getattribute__("_MAXRAY_NOTRANSFORM")
+        # object.__getattribute__(x, "_MAXRAY_NOTRANSFORM")
+        return False
+    except AttributeError:
+        pass
+
+    # __module__: The name of the module the function was defined in, or None if unavailable.
     if getattr(x, "__module__", None) in _GLOBAL_SKIP_MODULES:
+        return False
+    # TODO: also check ctx.fn_context.module?
+
+    return True
+
+
+def callable_allowed_for_transform(x, ctx: NodeContext):
+    if not transform_precheck(x, ctx):
         return False
 
     module_path = ctx.fn_context.module.split(".")
@@ -124,8 +159,9 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
     return (
         callable(x)  # super() has getset_descriptor instead of proper __dict__
         and hasattr(x, "__dict__")
-        and "_MAXRAY_TRANSFORMED" not in x.__dict__
-        and callable(getattr(x, "__hash__", None))
+        # and "_MAXRAY_TRANSFORMED" not in x.__dict__
+        # since we no longer rely on caching, we don't need to check for __hash__
+        # and callable(getattr(x, "__hash__", None))
         and getattr(type(x), "__module__", None) not in {"ctypes"}
         and (
             inspect.isfunction(x)
@@ -137,16 +173,26 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
 
 def instance_init_allowed_for_transform(x, ctx: NodeContext):
     """
-    Decides whether the __init__ method can be transformed.
+    Given a TYPE, decides whether its __init__ method can be transformed.
     """
+    if type(x) is not type:
+        # Filter out weird stuff that would get through with an isinstance check
+        # e.g. loguru: _GeneratorContextManager object is not an iterator (might be a separate bug)
+        return False
+
     if getattr(x, "__module__", None) in _GLOBAL_SKIP_MODULES:
         return False
 
+    try:
+        if not transform_precheck(x.__init__, ctx):
+            return False
+    except AttributeError:
+        return False
+
     return (
-        type(x) is type
-        and getattr(x, "__module__", None) not in {"ctypes"}
-        and hasattr(x, "__init__")
-        and not hasattr(x, "_MAXRAY_TRANSFORMED")
+        getattr(x, "__module__", None) not in {"ctypes"}
+        # and hasattr(x, "__init__")
+        # and not hasattr(x, "_MAXRAY_TRANSFORMED")
     )
 
 
@@ -154,15 +200,27 @@ def instance_call_allowed_for_transform(x, ctx: NodeContext):
     """
     Decides whether the __call__ method can be transformed.
     """
+    if type(x) is not type:
+        # if not isinstance(x, type):
+        return False
+
     if getattr(x, "__module__", None) in _GLOBAL_SKIP_MODULES:
         return False
 
+    try:
+        if not transform_precheck(x.__call__, ctx):
+            return False
+    except AttributeError:
+        return False
+
     return (
-        type(x) is type
-        and getattr(x, "__module__", None) not in {"ctypes"}
-        and hasattr(x, "__call__")
-        and not hasattr(x, "_MAXRAY_TRANSFORMED")
+        getattr(x, "__module__", None) not in {"ctypes"}
+        # and hasattr(x, "__call__")
+        # and not hasattr(x, "_MAXRAY_TRANSFORMED")
     )
+
+
+bad_qualnames = set()
 
 
 def _maxray_walker_handler(x, ctx: NodeContext):
@@ -178,9 +236,8 @@ def _maxray_walker_handler(x, ctx: NodeContext):
             case Ok(init_patch):
                 logger.debug(f"Patching __init__ for class {x}")
                 setattr(x, "__init__", init_patch)
-            # TODO: consolidate error handling and reporting
-            # case Err(bad):
-            #     logger.error(bad)
+            case Err(_err):
+                set_property_on_functionlike(x.__init__, "_MAXRAY_NOTRANSFORM", True)
 
     elif instance_call_allowed_for_transform(x, ctx):
         match recompile_fn_with_transform(
@@ -192,8 +249,8 @@ def _maxray_walker_handler(x, ctx: NodeContext):
             case Ok(call_patch):
                 logger.debug(f"Patching __call__ for class {x}")
                 setattr(x, "__call__", call_patch)
-            # case Err(bad):
-            #     logger.error(bad)
+            case Err(_err):
+                set_property_on_functionlike(x.__call__, "_MAXRAY_NOTRANSFORM", True)
 
     # 1b. normal functions or bound methods or method descriptors like @classmethod and @staticmethod
     elif callable_allowed_for_transform(x, ctx):
@@ -230,17 +287,42 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                                     f"monkey-patching bound method {x.__name__} on type {type(x.__self__)}"
                                 )
                                 parent_cls = type(x.__self__)
-                        # parent_cls = with_fn.method.defined_on_cls
-                        # parent_cls = with_fn.method.instance_cls
-                        # logger.success(
-                        #     f"monkey-patching bound method {x.__name__} on type {parent_cls} / {with_fn.method.defined_on_cls}"
+
+                        self_cls = parent_cls
+                        if with_fn.data.method_info.defined_on_cls is not None:
+                            parent_cls = with_fn.data.method_info.defined_on_cls
+                            # print(parent_cls)
+                        # breakpoint()
+                        # print(
+                        #     "parent_cls =", parent_cls, "x =", x, "self =", x.__self__
                         # )
+                        # print("x_trans", x_trans)
 
                         # Monkey-patching the methods. Probably unsafe and unsound
-                        setattr(parent_cls, x.__name__, x_trans)
-                        x_patched = getattr(
-                            x.__self__, x.__name__
-                        )  # getattr turns class descriptors (@classmethod) into bound methods
+                        # Descriptor guide: https://docs.python.org/3/howto/descriptor.html
+
+                        # Sanity check: check that our patch target is identical to the unbound version of the method (to prevent patching on the wrong class)
+                        supposed_x = getattr(parent_cls, x.__name__, None)
+                        if hasattr(supposed_x, "__func__"):
+                            supposed_x = supposed_x.__func__
+                        if supposed_x is x.__func__ and supposed_x is not None:
+                            setattr(parent_cls, x.__name__, x_trans)
+                            # x_patched = getattr(
+                            #     x.__self__, x.__name__
+                            # )  # getattr turns class descriptors (@classmethod) into bound methods
+                            x_patched = x_trans.__get__(x.__self__, self_cls)
+                            # print(x_patched)
+                        else:
+                            # Because any function can be assigned as a member of the class with an arbitrary name...
+                            logger.warning(
+                                "Could not monkey-patch because instance is incorrect"
+                            )
+                            set_property_on_functionlike(x, "_MAXRAY_NOTRANSFORM", True)
+                            x_patched = x
+
+                        # if "arg" in with_fn.data.module.lower():
+                        #     breakpoint()
+                        # if "arg" in with_fn.data.module.lower():
 
                         # We don't bother caching methods as they're monkey-patched
                         # SOUNDNESS: a package might manually keep references to __init__ around to later call them - but we'd just end up recompiling those as well
@@ -250,10 +332,15 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                     x = x_patched
 
                 case Err(e):
-                    # Cache failures
-                    _MAXRAY_FN_FAILED_CACHE.add(x)
+                    # Speedup by not trying to recompile the same bad function over and over
+                    # if x.__qualname__ in bad_qualnames:
+                    #     breakpoint()
+                    set_property_on_functionlike(x, "_MAXRAY_NOTRANSFORM", True)
+                    bad_qualnames.add(x.__qualname__)
                     # Errors in functions that have been recursively compiled are less important
-                    logger.warning(f"Failed to transform in walker handler: {e}")
+                    logger.warning(
+                        f"Failed to transform in walker handler: {e} {x.__qualname__}"
+                    )
 
     # We ignore writer calls triggered by code execution in other writers to prevent easily getting stuck in recursive hell
     # This happens *after* checking and patching callables to still allow for explicitly patching a callable/method by calling this handler
