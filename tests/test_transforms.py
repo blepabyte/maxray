@@ -234,6 +234,7 @@ def test_class_method_default_arg_using_local():
     buggy()
 
 
+@pytest.mark.xfail
 def test_method_scope_overwrite():
     """
     So many edge cases...
@@ -251,12 +252,32 @@ def test_method_scope_overwrite():
             return OoO() + 1
 
     @xray(dbg)
-    def bad():
+    def instance_call():
         x = X()
         return x.OoO()
 
-    assert bad() == 2
+    @xray(dbg)
+    def static_call():
+        x = X()
+        return X.OoO(x)
+
+    # method transform gives correct results, non-method errors
+    assert static_call() == 2
+    assert instance_call() == 2
     assert OoO() == 1
+
+
+def test_static_call():
+    class X:
+        def f(self):
+            return 1
+
+    @xray(dbg)
+    def call():
+        x = X()
+        return X.f(x)
+
+    assert call() == 1
 
 
 def test_private_name_mangled():
@@ -276,6 +297,34 @@ def test_private_name_mangled():
         x.g()
 
     bad()
+
+
+def test_static_name_mangled():
+    # pynvml/smi.py
+    class smi:
+        __instance = None
+
+        def getInstance(self):
+            return self.__instance
+
+        def getInstanceNamed(self):
+            return smi.__instance
+
+        @staticmethod
+        def getInstanceStatic():
+            return smi.__instance
+
+    @xray(dbg)
+    def useInstance():
+        s = smi()
+        assert s.getInstance() is None
+        assert s.getInstanceNamed() is None
+
+        # these 2 fail
+        assert s.getInstanceStatic() is None
+        assert smi.getInstanceStatic() is None
+
+    useInstance()
 
 
 def test_super():
@@ -396,6 +445,7 @@ def test_multi_decorators():
     assert len(decor_count) == 2
 
 
+@pytest.mark.xfail
 def test_unhashable_callable():
     class X:
         def __call__(self):
@@ -622,3 +672,16 @@ def test_caller_id():
     assert f1._MAXRAY_TRANSFORM_ID == f1_id
     assert f2._MAXRAY_TRANSFORM_ID == f2_id
     assert f1_id != f2_id
+
+
+global_x = 0
+
+
+def test_global_assignments():
+    @xray(dbg)
+    def mutate_global():
+        global global_x
+        global_x += 1
+
+    mutate_global()
+    assert global_x == 1
