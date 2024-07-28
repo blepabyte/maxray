@@ -677,11 +677,29 @@ def test_caller_id():
 global_x = 0
 
 
-def test_global_assignments():
-    @xray(dbg)
+def test_global_update():
     def mutate_global():
         global global_x
-        global_x += 1
+        global_x = 37
 
-    mutate_global()
-    assert global_x == 1
+    @xray(dbg)
+    def global_ops():
+        if global_x == 0:
+            mutate_global()
+        return global_x
+
+    assert global_ops() == 37
+    assert global_x == 37
+
+
+def test_global_set():
+    def set_global():
+        global global_y
+        global_y = 101
+
+    @xray(dbg)
+    def make_global():
+        set_global()
+
+    make_global()
+    assert global_y == 101

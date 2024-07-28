@@ -220,9 +220,6 @@ def instance_call_allowed_for_transform(x, ctx: NodeContext):
     )
 
 
-bad_qualnames = set()
-
-
 def _maxray_walker_handler(x, ctx: NodeContext):
     # 1.  logic to recursively patch callables
     # 1a. special-case callables: __init__ and __call__
@@ -291,12 +288,6 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                         self_cls = parent_cls
                         if with_fn.data.method_info.defined_on_cls is not None:
                             parent_cls = with_fn.data.method_info.defined_on_cls
-                            # print(parent_cls)
-                        # breakpoint()
-                        # print(
-                        #     "parent_cls =", parent_cls, "x =", x, "self =", x.__self__
-                        # )
-                        # print("x_trans", x_trans)
 
                         # Monkey-patching the methods. Probably unsafe and unsound
                         # Descriptor guide: https://docs.python.org/3/howto/descriptor.html
@@ -307,11 +298,7 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                             supposed_x = supposed_x.__func__
                         if supposed_x is x.__func__ and supposed_x is not None:
                             setattr(parent_cls, x.__name__, x_trans)
-                            # x_patched = getattr(
-                            #     x.__self__, x.__name__
-                            # )  # getattr turns class descriptors (@classmethod) into bound methods
                             x_patched = x_trans.__get__(x.__self__, self_cls)
-                            # print(x_patched)
                         else:
                             # Because any function can be assigned as a member of the class with an arbitrary name...
                             logger.warning(
@@ -319,10 +306,6 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                             )
                             set_property_on_functionlike(x, "_MAXRAY_NOTRANSFORM", True)
                             x_patched = x
-
-                        # if "arg" in with_fn.data.module.lower():
-                        #     breakpoint()
-                        # if "arg" in with_fn.data.module.lower():
 
                         # We don't bother caching methods as they're monkey-patched
                         # SOUNDNESS: a package might manually keep references to __init__ around to later call them - but we'd just end up recompiling those as well
@@ -332,12 +315,8 @@ def _maxray_walker_handler(x, ctx: NodeContext):
                     x = x_patched
 
                 case Err(e):
-                    # Speedup by not trying to recompile the same bad function over and over
-                    # if x.__qualname__ in bad_qualnames:
-                    #     breakpoint()
+                    # Speedup by not trying to recompile (getsource involves filesystem lookup) the same bad function over and over
                     set_property_on_functionlike(x, "_MAXRAY_NOTRANSFORM", True)
-                    bad_qualnames.add(x.__qualname__)
-                    # Errors in functions that have been recursively compiled are less important
                     logger.warning(
                         f"Failed to transform in walker handler: {e} {x.__qualname__}"
                     )

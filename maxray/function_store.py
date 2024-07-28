@@ -13,6 +13,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Optional
 
+from loguru import logger
+
 
 method_wrapper = type(object().__init__)
 wrapper_descriptor = type(object.__init__)
@@ -21,19 +23,19 @@ builtin_function_or_method = type(locals)
 
 def set_property_on_functionlike(fn, name: str, value: Any, recurse_wrappers=True):
     """
-    Tries to apply to functions, class descriptors, wrapped decorators, etc.
+    Tries to mark functions (including class descriptors, wrapped decorators, ...) with a property
     """
     if isinstance(fn, (method_wrapper, wrapper_descriptor, builtin_function_or_method)):
         return False
 
     ok = True
-    # Apply at *all* layers of wrapper
+    # SOUNDNESS: should this be applied recursively?
     if recurse_wrappers and hasattr(fn, "__wrapped__"):
-        ok = ok and set_property_on_functionlike(fn.__wrapped__, name, value)
+        # Apply at all layers of wrapper
+        ok = set_property_on_functionlike(fn.__wrapped__, name, value) and ok
 
     try:
         setattr(fn, name, value)
-        assert not inspect.ismethod(fn)
     except AttributeError as err:
         # Apply to underlying method if bound
         if inspect.ismethod(fn):
@@ -42,8 +44,7 @@ def set_property_on_functionlike(fn, name: str, value: Any, recurse_wrappers=Tru
         else:
             ok = False
 
-            # DEBUG-ONLY
-            raise Exception(f"{type(fn)} - couldn't set: {err}")
+            logger.error(f"{err}: couldn't set property on {type(fn)}")
     return ok
 
 
@@ -92,10 +93,14 @@ class Method:
         return Method(True, self_cls, qual_cls)
 
     def to_dict(self):
-        raise NotImplementedError()
         return {
-            "instance_cls": self.instance_cls.__name__,
-            "defined_on_cls": self.defined_on_cls.__name__,
+            "is_inspect_method": self.is_inspect_method,
+            "instance_cls": self.instance_cls.__name__
+            if self.instance_cls is not None
+            else None,
+            "defined_on_cls": self.defined_on_cls.__name__
+            if self.defined_on_cls is not None
+            else None,
         }
 
 
@@ -119,7 +124,6 @@ class FunctionData:
     @staticmethod
     def create(fn, from_ctx: Optional["NodeContext"]):
         if hasattr(fn, "__wrapped__"):
-            # wrappers.append(fn)
             fn = fn.__wrapped__
 
         name = getattr(fn, "__name__", None)
@@ -168,7 +172,7 @@ class FunctionData:
     def validate(
         fn, from_ctx: Optional["NodeContext"] = None
     ) -> Result[FunctionData, str]:
-        # Checks it's at *least* a function of some kind
+        # Required to be at least a function of some kind to be worth logging errors to FunctionStore
         if not callable(fn):
             return Err("Not even callable")
 
@@ -220,7 +224,7 @@ class FunctionData:
 class CompiledFunction:
     data: FunctionData
 
-    # Add more fields here with runtime metadata about the function.
+    # TODO: Add more fields here with runtime metadata about the function
 
     def to_dict(self):
         d = asdict(self.data)
@@ -237,6 +241,7 @@ class ErroredFunction:
 
     def to_dict(self):
         d = asdict(self.data)
+        # TODO: Serialise method info properly
         del d["method_info"]
         d["ok"] = False
         d["error_reason"] = self.error_reason
@@ -247,185 +252,6 @@ def prepare_function_for_transform(
     fn, from_ctx: Optional["NodeContext"] = None
 ) -> Result[FunctionData, str]:
     return FunctionData.validate(fn, from_ctx)
-
-
-@dataclass
-class WithFunction:
-    name: str
-    qualname: str
-    module: str
-    source: str
-    source_file: str
-
-    method: Method | None
-
-    compile_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-
-    added_context: dict = field(default_factory=dict)
-    "Arbitrary extra data that won't be saved to the output table"
-
-    @staticmethod
-    def try_for_transform(
-        fn,
-    ) -> Result[tuple[Any, WithFunction], tuple[str, WithFunction | None]]:
-        """
-        Does basic validation and gathers + stores metadata as a precondition for `recompile_fn_with_transform` to run.
-        Also unnests decorator/descriptor wrappers to get the target function to apply the transform to.
-        """
-        if not callable(fn):
-            return Err(("Not even callable", None))
-
-        if "<" in getattr(fn, "__name__", ""):
-            return Err(("Name containing invalid chars", None))
-        # Unwraps things like functools.wraps, functools.lru_cache as well as descriptors like @classmethod and @staticmethod to get to the underlying function
-        wrappers = []
-        if hasattr(fn, "__wrapped__"):
-            wrappers.append(fn)
-            fn = fn.__wrapped__
-
-        if "<" in getattr(fn, "__name__", ""):
-            return Err(("Name containing invalid chars", None))
-
-        # Determines if we treat this as a method
-        is_method = inspect.ismethod(fn)
-        if is_method:
-            if inspect.isclass(fn.__self__):  # classmethod
-                self_cls = fn.__self__
-            else:
-                self_cls = type(fn.__self__)
-
-            use_name = getattr(fn, "__name__", "")
-            if use_name.startswith("__") and not use_name.endswith(
-                "__"
-            ):  # mangled method
-                use_name = f"_{self_cls.__name__}{use_name}"
-
-            # try:
-            #     defn_cls_name, _name = fn.__qualname__.rsplit(".", 1)
-            #     (defn_cls,) = [
-            #         q for q in self_cls.mro() if q.__qualname__ == defn_cls_name
-            #     ]
-            #     fn = defn_cls.__dict__[use_name]
-            # except Exception as e:
-            #     # print(e)
-            #     # breakpoint()
-            #     defn_cls = self_cls
-
-            # last_fn = None
-            # while hasattr(fn, "__wrapped__") or inspect.ismethod(fn):
-            #     if last_fn is fn:
-            #         raise RecursionError("The method won't fucking die")
-            #     last_fn = fn
-
-            #     while hasattr(fn, "__wrapped__"):
-            #         wrappers.append(fn)
-            #         fn = fn.__wrapped__
-
-            #     # This is a descriptor, let's get the actual function object
-            #     # for defn_cls in self_cls.mro():
-            #     #     # TODO: use_name or plain name? is mangling done on dict?
-            #     #     if use_name in defn_cls.__dict__:
-            #     #         fn = defn_cls.__dict__[use_name]
-            #     #         assert not inspect.ismethod(fn)
-            #     #         break
-
-            #     while hasattr(fn, "__wrapped__"):
-            #         wrappers.append(fn)
-            #         fn = fn.__wrapped__
-
-            # print([(type(w), w) for w in wrappers])
-            # while hasattr(fn, "__wrapped__"):
-            #     wrappers.append(fn)
-            #     fn = fn.__wrapped__
-        else:
-            self_cls = None
-            defn_cls = None
-
-        if not callable(fn):
-            return Err(("Resolved object from fn not callable", None))
-
-        name = getattr(fn, "__name__", None)
-        qualname = getattr(fn, "__qualname__", None)
-        module = getattr(fn, "__module__", None)
-
-        try:
-            original_source = inspect.getsource(fn)
-            # nested functions have excess indentation preventing compile; inspect.cleandoc(source) is an alternative but less reliable
-            source = textwrap.dedent(original_source)
-            # used to map source back to correct original location
-            dedent_chars = original_source.find("\n") - source.find("\n")
-        except OSError:
-            source = None
-        except TypeError:
-            source = None
-
-        try:
-            sourcefile = inspect.getsourcefile(fn)
-        except TypeError:
-            sourcefile = None
-
-        if is_method:
-            method = Method(True, self_cls, self_cls)
-        else:
-            method = None
-        maybe_fn = WithFunction(name, qualname, module, source, sourcefile, method)
-
-        if source is None:
-            # assert not hasattr(fn, "_MAXRAY_TRANSFORM_ID")
-            return maybe_fn.errored(f"No source code for function {get_fn_name(fn)}")
-        maybe_fn.added_context["dedent_chars"] = dedent_chars
-
-        # codegen (e.g. numpy's array hooks) results in functions that have source code but no corresponding source file
-        # the source file of `np.unique` is <__array_function__ internals>
-        if sourcefile is None or not Path(sourcefile).exists():
-            return maybe_fn.errored(
-                f"Non-existent source file ({sourcefile}) for function {get_fn_name(fn)}"
-            )
-
-        if name is None:
-            return maybe_fn.errored(
-                f"There is no __name__ for function {get_fn_name(fn)}"
-            )
-
-        if name == "<lambda>":
-            return maybe_fn.errored("Cannot safely recompile lambda functions")
-
-        if qualname is None:
-            return maybe_fn.errored(
-                f"There is no __qualname__ for function {get_fn_name(fn)}"
-            )
-
-        if module is None:
-            return maybe_fn.errored(
-                f"There is no __module__ for function {get_fn_name(fn)}"
-            )
-
-        # Is there a better way to "track" function identity? Not sure about weakref...
-        try:
-            fn._MAXRAY_TRANSFORM_ID = maybe_fn.compile_id
-        except AttributeError as err:
-            # print(err)
-            pass
-            # breakpoint()
-
-        return Ok((fn, maybe_fn))
-
-    def compiled(self):
-        # if (instance := FunctionStore.instance.get(None)) is not None:
-        with FunctionStore.lock:
-            FunctionStore.instance.functions[self.compile_id] = self
-        return self
-
-    def errored(self, err):
-        with FunctionStore.lock:
-            FunctionStore.instance.failures[self.compile_id] = self
-        return Err((err, self))
-
-    def to_dict(self):
-        data = asdict(self)
-        if self.method is not None:
-            data["method"] = self.method.to_dict()
-        return data
 
 
 class FunctionStore:
@@ -452,7 +278,7 @@ class FunctionStore:
 
     @staticmethod
     def collect():
-        # Disable locking by default? (also better context iface)
+        # TODO: Disable locking by default? (design a better context interface?)
         with FunctionStore.lock:
             return pa.table(
                 pa.array(

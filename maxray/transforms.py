@@ -1,15 +1,16 @@
-from .function_store import FunctionData, prepare_function_for_transform, get_fn_name
+from .function_store import (
+    FunctionData,
+    prepare_function_for_transform,
+    get_fn_name,
+    set_property_on_functionlike,
+)
 
 import ast
 import inspect
 import sys
-import uuid
-import re
 import builtins
 
-from textwrap import dedent
-from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from copy import deepcopy
 from result import Result, Ok, Err
 from contextvars import ContextVar
@@ -18,17 +19,6 @@ from functools import wraps
 from typing import Any, Callable, Optional
 
 from loguru import logger
-
-
-_METHOD_MANGLE_NAME = "vdxivosjdovs_method"
-
-
-def mangle_name(identifier):
-    raise NotImplementedError()
-
-
-def unmangle_name(identifier):
-    raise NotImplementedError()
 
 
 @dataclass
@@ -53,16 +43,17 @@ class FnContext:
 class NodeContext:
     id: str
     """
-    Identifier for the type of syntax node this event came from. For example:
-    - name/x
-    - call/foo
+    Identifier for the type of syntax node this event came from (`name/x`, `call/foo`, ...)
     """
 
     source: str
 
     fn_context: FnContext
     """
-    Properties of the function containing this node.
+    Resolved info of the function within which the source code of this node was transformed/compiled.
+    
+    Notes:
+        Not necessarily the actual active/called function (w.r.t. call stack) in the case of nested function defs (transformed as a whole).
     """
 
     location: tuple[int, int, int, int]
@@ -119,6 +110,11 @@ class FnRewriter(ast.NodeTransformer):
         # the first `def` we encounter is the one that we're transforming. Subsequent ones will be nested/within class definitions.
         self.fn_count = 0
         self.known_globals_stack = []
+
+        # function name to use to extract rewritten function from scope after executing the def
+        # for methods, the name will be mangled (since they shouldn't be accessible in the module namespace)
+        # for functions, will return the plain name (which might not be the __name__ of the obtained `source_fn` as __name__ can be set arbitrarily)
+        self.defined_fn_name = None
 
     def is_method(self):
         return self.instance_type is not None
@@ -306,7 +302,12 @@ class FnRewriter(ast.NodeTransformer):
     @staticmethod
     def temp_binding(node):
         """
-        Returns a wrapping node that sets the temporary, and a node to retrieve the last set value.
+        Useful to inspect/cache/transform some callable before calling it.
+
+        Returns: (
+            wrap_node: replacement expr for `node` that sets a temporary via a local variable
+            get_node: expr retrieving the last set value of `node` without having to re-evaluate it)
+        )
         """
         wrap_node = ast.fix_missing_locations(
             ast.Call(
@@ -322,31 +323,23 @@ class FnRewriter(ast.NodeTransformer):
                 ctx=ast.Load(),
             )
         )
+        """
+        A prior approach used a walrus expression to assign to a temporary but:
+        > Cannot use walrus expressions in nested list comprehension context
+        """
         return wrap_node, get_node
-        # Cannot use walrus expressions in nested list comprehension context
-        # return ast.fix_missing_locations(
-        #     ast.Subscript(
-        #         value=ast.Tuple(
-        #             elts=[
-        #                 ast.NamedExpr(
-        #                     target=ast.Name(id=by_name, ctx=ast.Store()),
-        #                     value=node,
-        #                 ),
-        #                 ast.Name(id=by_name, ctx=ast.Load()),
-        #             ],
-        #             ctx=ast.Load(),
-        #         ),
-        #         slice=ast.Constant(-1),
-        #         ctx=ast.Load(),
-        #     )
-        # )
 
     def visit_Call(self, node):
         source_pre = self.recover_source(node)
         node_pre = deepcopy(node)
         node = deepcopy(node)
 
+        # Handles magic super() calls - not totally sure this is correct...
+        # TODO: maybe assign the super() proxy and do the MRO patching at the start of the function
         match node:
+            case ast.Call(func=ast.Name(id="globals"), args=[]):
+                return ast.Name("_MAXRAY_MODULE_GLOBALS", ctx=ast.Load())
+
             case ast.Call(func=ast.Name(id="super"), args=[]):
                 # HACK: STUPID HACKY HACK
                 # TODO: detect @classmethod properly
@@ -367,20 +360,17 @@ class FnRewriter(ast.NodeTransformer):
                 )
                 ast.fix_missing_locations(node)
 
-        node = self.generic_visit(node)  # mutates
+        node = self.generic_visit(node)
         # Want to keep track of which function we're calling
-        # very very not thread-safe...
-        # `node.func` is now likely a call to `_maxray_walker_handler`
+        # Can't do ops on `node_pre.func` beacuse evaluating it has side effects
+        # `node.func` is likely a call to `_maxray_walker_handler`
         node.func, node_func_ref = self.temp_binding(node.func)
-        # We can't use `node_pre.func` beacuse evaluating it has side effects
 
-        # TODO: maybe assign the super() proxy and do the MRO patching at the start of the function
         extra_kwargs = []
         if "super" not in source_pre:
             extra_kwargs.append(
                 ast.keyword(
                     "caller_id",
-                    # value=ast.Name("_MAXRAY_TEMP_VAR", ctx=ast.Load()),
                     value=ast.Call(
                         func=ast.Name("getattr", ctx=ast.Load()),
                         args=[
@@ -412,8 +402,14 @@ class FnRewriter(ast.NodeTransformer):
         self.fn_count += 1
 
         # Only overwrite the name of our "target function"
-        if self.fn_count == 1 and self.is_method():
-            node.name = f"{node.name}_{self.instance_type}_{node.name}"
+        if self.fn_count == 1:
+            if self.is_method():
+                node.name = f"{node.name}_{self.instance_type}_{node.name}"
+            self.defined_fn_name = node.name
+        else:
+            node.decorator_list.insert(
+                0, ast.Name("_MAXRAY_DECORATE_INNER_NOTRANSFORM", ctx=ast.Load())
+            )
 
         # Decorators are evaluated sequentially: decorators applied *before* our one (should?) get ignored while decorators applied *after* work correctly
         is_transform_root = self.fn_count == 1 and self.is_maxray_root
@@ -443,10 +439,11 @@ class FnRewriter(ast.NodeTransformer):
 
         node.returns = None
 
+        # avoid transforming decorators
         node.body = [self.visit(stmt) for stmt in node.body]
         out = node
-        # out = self.generic_visit(node)
 
+        # mutable storage location for `temp_binding`
         assign_stmt = ast.Assign(
             targets=[ast.Name(id="_MAXRAY_TEMP_LOCAL_VAR", ctx=ast.Store())],
             value=ast.List(elts=[ast.Constant(value=None)], ctx=ast.Load()),
@@ -473,7 +470,6 @@ class FnRewriter(ast.NodeTransformer):
         # global declaration only applies at immediate function def level
         self.known_globals_stack[-1].update(node.names)
         return ast.fix_missing_locations(ast.Expr(ast.Constant(None)))
-        # return self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         return self.transform_function_def(node)
@@ -482,7 +478,28 @@ class FnRewriter(ast.NodeTransformer):
         return self.transform_function_def(node)
 
 
-_TRANSFORM_CACHE = {}
+class BackingDict(dict):
+    """
+    We want the scope of a function to be "its module scope" + "a bunch of stuff we define on top of it" - but having scope = {**vars(), **stuff} results in changes to the module not being reflected within the scope.
+    """
+
+    def __init__(self, *primary_layers, backing_layers: list[dict]):
+        super().__init__()
+        for p in primary_layers:
+            self.update(p)
+
+        self.backing_layers = backing_layers
+
+    def __getitem__(self, key):
+        if key in self:
+            return super().__getitem__(key)
+
+        for backing in self.backing_layers:
+            if key in backing:
+                return backing[key]
+        raise KeyError(
+            f"{key} not found in backing dict ({len(self.backing_layers)} layers)"
+        )
 
 
 def recompile_fn_with_transform(
@@ -499,28 +516,22 @@ def recompile_fn_with_transform(
     """
     Recompiles `source_fn` so that essentially every node of its AST tree is wrapped by a call to `transform_fn` with the evaluated value along with context information about the source code.
     """
+
     original_source_fn = source_fn
+
+    # handle things like `functools.wraps`
+    while hasattr(source_fn, "__wrapped__"):
+        # SOUNDNESS: failure when decorators aren't applied at the definition site (will look for the original definition, ignoring any transformations that have been applied before the wrap but after definition)
+        source_fn = source_fn.__wrapped__
+
     match prepare_function_for_transform(source_fn, from_ctx=triggered_by_node):
         case Ok(with_source_fn):
             pass
         case Err(err):
             logger.error(err)
             return Err(err)
-    # match WithFunction.try_for_transform(source_fn):
-    #     case Ok((source_fn, with_source_fn)):
-    #         pass
-    #     case Err((err, _wf)):
-    #         return Err(err)
-
-    source_fn = original_source_fn
-    # handle `functools.wraps`
-    # TODO: multiple layers of nesting?
-    if hasattr(source_fn, "__wrapped__"):
-        # SOUNDNESS: failure when decorators aren't applied at the definition site (will look for the original definition, ignoring any transformations that have been applied before the wrap but after definition)
-        source_fn = source_fn.__wrapped__
 
     module = lookup_module(with_source_fn)
-    # module = inspect.getmodule(source_fn)
     if module is None:
         return with_source_fn.mark_errored(
             f"Non-existent source module `{getattr(source_fn, '__module__', None)}` for function {get_fn_name(source_fn)}"
@@ -534,7 +545,6 @@ def recompile_fn_with_transform(
         )
 
     # TODO: warn on "nonlocal" statements?
-
     match fn_ast:
         case ast.Module(body=[ast.FunctionDef() | ast.AsyncFunctionDef()]):
             # Good
@@ -548,10 +558,7 @@ def recompile_fn_with_transform(
         ast_pre_callback(fn_ast)
 
     fn_is_method = with_source_fn.method_info.is_inspect_method
-    # fn_is_method = with_source_fn.method.is_inspect_method is not None
     if fn_is_method:
-        # parent_cls = with_source_fn.method.instance_cls
-        # parent_cls = with_source_fn.method.instance_cls
         # Many potential unintended side-effects
         match original_source_fn.__self__:
             case type():
@@ -569,11 +576,14 @@ def recompile_fn_with_transform(
         fn_is_method = True
         parent_cls = special_use_instance_type
 
+    module_name = module.__name__
+    module_base_naem = module.__name__.split(".")[0]
+
     fn_call_counter = ContextVar("maxray_call_counter", default=0)
     fn_context = FnContext(
         source_fn,
         source_fn.__qualname__,
-        module.__name__,
+        module_name,
         with_source_fn.source,
         with_source_fn.source_file,
         with_source_fn.source_offset_lines,
@@ -581,15 +591,15 @@ def recompile_fn_with_transform(
         compile_id=with_source_fn.compile_id,
     )
     instance_type = parent_cls.__name__ if fn_is_method else None
-    transformed_fn_ast = FnRewriter(
+    fn_rewriter = FnRewriter(
         transform_fn,
         fn_context,
         instance_type=instance_type,
         dedent_chars=with_source_fn.source_dedent_chars,
-        # dedent_chars=with_source_fn.added_context["dedent_chars"],
         pass_locals_on_return=pass_scope,
         is_maxray_root=is_maxray_root,
-    ).visit(fn_ast)
+    )
+    transformed_fn_ast = fn_rewriter.visit(fn_ast)
     ast.fix_missing_locations(transformed_fn_ast)
 
     if ast_post_callback is not None:
@@ -612,6 +622,7 @@ def recompile_fn_with_transform(
             "_MAXRAY_FN_CONTEXT": fn_context,
             "_MAXRAY_CALL_COUNTER": fn_call_counter,
             "_MAXRAY_DECORATE_WITH_COUNTER": count_calls_with,
+            "_MAXRAY_DECORATE_INNER_NOTRANSFORM": ensure_notransform,
             "_MAXRAY_BUILTINS_LOCALS": locals,
             "_MAXRAY_PATCH_MRO": patch_mro,
             "_MAXRAY_MODULE_GLOBALS": vars(
@@ -623,6 +634,10 @@ def recompile_fn_with_transform(
         "module": {},
         "closure": {},
     }
+
+    # Fix relative imports within functions
+    if override_scope.get("__name__", None) != "__main__":
+        scope_layers["override"]["__package__"] = module_base_naem
 
     # BUG: this will NOT work with threading - could use ContextVar if no performance impact?
     def set_temp(state, value):
@@ -668,12 +683,13 @@ def recompile_fn_with_transform(
         # TODO: this might be slow
         scope = {
             **scope_layers["class_local"],
-            **vars(builtins),
             **scope_layers["core"],
-            **scope_layers["module"],
+            # **vars(builtins),
+            # **scope_layers["module"],
             **scope_layers["closure"],
             **scope_layers["override"],
         }
+        scope = BackingDict(scope, backing_layers=[vars(module), vars(builtins)])
 
         if not fn_is_method and source_fn.__name__ in scope:
             logger.warning(
@@ -732,17 +748,13 @@ def recompile_fn_with_transform(
                 return with_source_fn.mark_errored(
                     f"Re-def of function {get_fn_name(source_fn)} in its source file module at {with_source_fn.source_file} also failed"
                 )
+            exit(111)
         else:
             return with_source_fn.mark_errored(
                 f"Failed to re-def function {get_fn_name(source_fn)} and its source file {with_source_fn.source_file} was not found in sys.modules"
             )
 
-    if fn_is_method:
-        transformed_fn = scope[
-            f"{source_fn.__name__}_{instance_type}_{source_fn.__name__}"
-        ]
-    else:
-        transformed_fn = scope[source_fn.__name__]
+    transformed_fn = scope[fn_rewriter.defined_fn_name]
 
     # a decorator doesn't actually have to return a function! (could be used solely for side effect) e.g. `@register_backend_lookup_factory` for `find_content_backend` in `awkward/contents/content.py`
     if not callable(transformed_fn) and not inspect.ismethoddescriptor(transformed_fn):
@@ -752,12 +764,16 @@ def recompile_fn_with_transform(
 
     # unmangle the name again - it's possible some packages might use __name__ internally for registries and whatnot
     transformed_fn.__name__ = source_fn.__name__
+    transformed_fn.__qualname__ = source_fn.__qualname__
 
     # way to keep track of which functions we've already transformed
     transformed_fn._MAXRAY_TRANSFORMED = True
     transformed_fn._MAXRAY_TRANSFORM_ID = with_source_fn.compile_id
     with_source_fn.mark_compiled(transformed_fn)
 
+    transformed_fn.__module__ = module.__name__
+
+    # TODO: unify places where transform ID is set
     # if hasattr(transformed_fn, "__wrapped__"):
     #     transformed_fn.__wrapped__._MAXRAY_TRANSFORMED = True
     #     transformed_fn.__wrapped__._MAXRAY_TRANSFORM_ID = (
@@ -826,3 +842,8 @@ def lookup_module(fd: FunctionData):
         return file_matched
     else:
         return module_matched
+
+
+def ensure_notransform(f):
+    set_property_on_functionlike(f, "_MAXRAY_NOTRANSFORM", True)
+    return f
