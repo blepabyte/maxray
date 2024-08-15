@@ -59,6 +59,9 @@ class NodeContext:
     location: tuple[int, int, int, int]
     """
     (start_line, end_line, start_col, end_col) as 0-indexed location of `source` in `fn_context.source_file`
+
+    Notes:
+        end_col is the exclusive endpoint of the range
     """
 
     local_scope: Any = None
@@ -142,6 +145,8 @@ class FnRewriter(ast.NodeTransformer):
     def recover_source(self, pre_node):
         segment = ast.get_source_segment(self.fn_context.source, pre_node, padded=False)
         if segment is None:
+            logger.warning(f"No source segment for {self.fn_context}")
+            logger.info(self.safe_unparse(pre_node))
             return self.safe_unparse(pre_node)
         return segment
 
@@ -249,10 +254,12 @@ class FnRewriter(ast.NodeTransformer):
         if self.is_private_class_name(node.attr):
             # currently we do a bad job of actually checking if it's supposed to be a method-like so this is just a hopeful guess
             qualname_type_guess = self.fn_context.name.split(".")[-2]
-            if self.instance_type is not None:
-                node.attr = f"_{self.instance_type}{node.attr}"
-            else:
-                node.attr = f"_{qualname_type_guess}{node.attr}"
+            resolve_type_name = (
+                self.instance_type
+                if self.instance_type is not None
+                else qualname_type_guess
+            )
+            node.attr = f"_{resolve_type_name.lstrip('_')}{node.attr}"
             logger.warning("Replaced with mangled private name")
 
         if isinstance(node.ctx, ast.Load):
@@ -277,16 +284,23 @@ class FnRewriter(ast.NodeTransformer):
         return node
 
     def visit_Return(self, node: ast.Return) -> Any:
+        """
+        `return` is a non-expression node. Though adding an event on this node is redundant (callback would already be invoked on the expression to be returned), it's still useful to track what was returned or override it.
+        """
+        source_pre = self.recover_source(node)
         node_pre = deepcopy(node)
         node = deepcopy(node)
 
-        if node.value is None:
-            node.value = ast.Constant(None)
-
         # Note: For a plain `return` statement, there's no source for a thing that *isn't* returned
-        value_source_pre = self.recover_source(node.value)
+        value_source_pre = (
+            "None" if node.value is None else self.recover_source(node.value)
+        )
 
-        node = self.generic_visit(node)
+        if node.value is None:
+            #     # Don't want to invoke a callback on a node that doesn't actually exist
+            node.value = ast.Constant(None)
+        else:
+            node = self.generic_visit(node)
 
         # TODO: Check source locations are correct here
         ast.fix_missing_locations(node)
@@ -577,7 +591,8 @@ def recompile_fn_with_transform(
         parent_cls = special_use_instance_type
 
     module_name = module.__name__
-    module_base_naem = module.__name__.split(".")[0]
+    use_relative_import_root = module.__name__.split(".")[0]
+    use_relative_import_root = getattr(module, "__package__", use_relative_import_root)
 
     fn_call_counter = ContextVar("maxray_call_counter", default=0)
     fn_context = FnContext(
@@ -615,6 +630,9 @@ def recompile_fn_with_transform(
 
         return super_type
 
+    # TODO: does this make a difference? are superclasses even getting patched properly?
+    # patch_mro._MAXRAY_NOTRANSFORM = True
+
     scope_layers = {
         "core": {
             transform_fn.__name__: transform_fn,
@@ -637,7 +655,7 @@ def recompile_fn_with_transform(
 
     # Fix relative imports within functions
     if override_scope.get("__name__", None) != "__main__":
-        scope_layers["override"]["__package__"] = module_base_naem
+        scope_layers["override"]["__package__"] = use_relative_import_root
 
     # BUG: this will NOT work with threading - could use ContextVar if no performance impact?
     def set_temp(state, value):
@@ -770,6 +788,10 @@ def recompile_fn_with_transform(
     transformed_fn._MAXRAY_TRANSFORMED = True
     transformed_fn._MAXRAY_TRANSFORM_ID = with_source_fn.compile_id
     with_source_fn.mark_compiled(transformed_fn)
+
+    assert set_property_on_functionlike(
+        transformed_fn, "_MAXRAY_TRANSFORM_ID", with_source_fn.compile_id
+    )
 
     transformed_fn.__module__ = module.__name__
 

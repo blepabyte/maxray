@@ -29,10 +29,11 @@ def set_property_on_functionlike(fn, name: str, value: Any, recurse_wrappers=Tru
         return False
 
     ok = True
-    # SOUNDNESS: should this be applied recursively?
     if recurse_wrappers and hasattr(fn, "__wrapped__"):
         # Apply at all layers of wrapper
-        ok = set_property_on_functionlike(fn.__wrapped__, name, value) and ok
+        ok = (
+            set_property_on_functionlike(fn.__wrapped__, name, value, True) and ok
+        )  # don't short-circuit
 
     try:
         setattr(fn, name, value)

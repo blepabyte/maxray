@@ -1,4 +1,4 @@
-from maxray import maxray, NodeContext
+from maxray import maxray, NodeContext, _inator_inator
 from maxray.capture.logs import CaptureLogs
 from maxray.capture.exec_sources import ExecSource, DynamicSymbol
 from maxray.function_store import FunctionStore
@@ -43,7 +43,7 @@ class Quit(BaseException): ...
 
 
 def dump_on_exception():
-    console.print_exception(show_locals=True, suppress=["maxray"], max_frames=1)
+    console.print_exception(show_locals=False, max_frames=22)
 
 
 def empty_module(module_name: str):
@@ -266,6 +266,7 @@ class ScriptRunner:
     run_type: ScriptFromFile | ScriptFromString | ScriptFromModule
     enable_capture: bool = True
     with_decor_inator: Callable = lambda x, ctx: x
+    restrict_to_source_module: bool = False
     temp_sourcefile: Any = field(
         default_factory=lambda: tempfile.NamedTemporaryFile("w", delete=False)
     )
@@ -284,6 +285,11 @@ class ScriptRunner:
 
     def compile_to_callable(self):
         source = self.run_type.source()
+        # HACK: stupid hack (since everything gets wrapped in a function, globals become nonlocals)
+        # TODO: support passing AST mods to transform
+        # BUG: won't show up in `globals()`
+        source = source.replace("global ", "nonlocal ")
+
         new_source = f"""def {self.MAIN_FN_NAME}():
 {indent(source, '    ')}
     return locals()
@@ -317,6 +323,7 @@ class ScriptRunner:
     def run(self):
         # Fixes same-directory imports (as the actual script is in some random temp dir)
         prev_sys_path = [*sys.path]
+        # TODO: remove from path after
         sys.path.extend(self.run_type.extra_sys_path())
 
         exc = None
@@ -324,6 +331,11 @@ class ScriptRunner:
         try:
             fn = maxray(
                 self.rewrite_node,
+                root_inator=_inator_inator(
+                    [self.run_type.in_module().__name__]
+                    if self.restrict_to_source_module
+                    else None
+                ),
                 initial_scope={
                     "__name__": "__main__",
                     "__file__": self.run_type.sourcemap_to(),
@@ -363,9 +375,11 @@ class ScriptRunner:
         except SystemExit:
             # click gives us no choice because it *insists* on stealing KeyboardInterrupt even in standalone mode and throwing SystemExit
             pass
-        except:  # IDGAF just quit
+        except BaseException as e:  # IDGAF just quit
             # Hide stupidly long stack trace on exit (BdbQuit)
             # TODO: Handle properly
+            dump_on_exception()
+            print(e)
             exit(1)
         finally:
             sys.path = prev_sys_path
@@ -540,6 +554,11 @@ _DEFAULT_CAPTURE_LOGS_NAME = ".maxray-logs.arrow"
     is_flag=True,
     help="Won't exit on completion and will wait for a file change event to run the script again.",
 )
+@click.option(
+    "--restrict",
+    is_flag=True,
+    help="Don't recursively patch source code, only tracing code in the immediately invoked script file",
+)
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def cli(
     script: str,
@@ -549,6 +568,7 @@ def cli(
     loop: bool,
     capture_default: bool,
     capture: Optional[str],
+    restrict: bool,
     args,
 ):
     # Reset sys.argv so client scripts don't try to parse our arguments
@@ -566,7 +586,9 @@ def cli(
         hooks.extend(InstanceWatchHook.build(spec) for spec in watch_instance)
 
     run_wrapper = ScriptRunner(
-        run, enable_capture=(capture is not None) or capture_default
+        run,
+        enable_capture=(capture is not None) or capture_default,
+        restrict_to_source_module=restrict,
     )
 
     as_interactive = len(hooks) > 0 or loop
