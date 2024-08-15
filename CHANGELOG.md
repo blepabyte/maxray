@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## v0.4.0 (2024-08-15)
+
+### Chore
+
+* chore: add package name as script to work with pipx/uv ([`b70b3ee`](https://github.com/blepabyte/maxray/commit/b70b3ee1298e62586e4932594dfcb8f39b10ebf7))
+
+### Feature
+
+* feat(capture): stateful watching with -W ([`6b16aed`](https://github.com/blepabyte/maxray/commit/6b16aed27272ee1a7e88a41ac3dc61158485fa69))
+
+* feat: improved method patching correctness ([`a5c991e`](https://github.com/blepabyte/maxray/commit/a5c991ed2e2a575acd480a7f931b42555e7d2a39))
+
+### Fix
+
+* fix: __init__ and __call__ are not mutually exclusive ([`89ba42c`](https://github.com/blepabyte/maxray/commit/89ba42cbfbeec31c41dfb6ebb55016a6a46c7686))
+
+* fix: transform control flow and relative package import ([`aaee9f0`](https://github.com/blepabyte/maxray/commit/aaee9f07cf01e74b1cfeee3db913bb2e4a8ac299))
+
+* fix: scope should reflect changes to module state ([`0ee134e`](https://github.com/blepabyte/maxray/commit/0ee134eb3abe759508d9c7ba09f54d2d38d63e49))
+
+* fix: support `global` ([`38387be`](https://github.com/blepabyte/maxray/commit/38387be9ddcfed8740f58fbfaf4c2557cc0cd9f9))
+
+### Refactor
+
+* refactor: better data model for FunctionStore ([`7863b3a`](https://github.com/blepabyte/maxray/commit/7863b3a588896ad1b1587ae2c822ef5951053dcc))
+
+### Test
+
+* test: more transform cases ([`b528f67`](https://github.com/blepabyte/maxray/commit/b528f6763c2c4513b241a71875746842e9185a65))
+
 ## v0.3.0 (2024-06-25)
 
 ### Chore
