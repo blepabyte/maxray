@@ -2,7 +2,6 @@ from .transforms import recompile_fn_with_transform, NodeContext
 from .function_store import FunctionStore, set_property_on_functionlike
 
 import inspect
-from weakref import ref, WeakSet
 from contextvars import ContextVar
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -174,9 +173,9 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
     )
 
 
-def instance_init_allowed_for_transform(x, ctx: NodeContext):
+def instance_allowed_for_transform(x, ctx: NodeContext):
     """
-    Given a TYPE, decides whether its __init__ method can be transformed.
+    Checks if x is a type with dunder methods can be correctly transformed.
     """
     if type(x) is not type:
         # Filter out weird stuff that would get through with an isinstance check
@@ -186,33 +185,7 @@ def instance_init_allowed_for_transform(x, ctx: NodeContext):
     if getattr(x, "__module__", None) in _GLOBAL_SKIP_MODULES:
         return False
 
-    try:
-        if not transform_precheck(x.__init__, ctx):
-            return False
-    except AttributeError:
-        return False
-
-    return getattr(x, "__module__", None) not in {"ctypes"}
-
-
-def instance_call_allowed_for_transform(x, ctx: NodeContext):
-    """
-    Decides whether the __call__ method can be transformed.
-    """
-    if type(x) is not type:
-        # if not isinstance(x, type):
-        return False
-
-    if getattr(x, "__module__", None) in _GLOBAL_SKIP_MODULES:
-        return False
-
-    try:
-        if not transform_precheck(x.__call__, ctx):
-            return False
-    except AttributeError:
-        return False
-
-    return getattr(x, "__module__", None) not in {"ctypes"}
+    return True
 
 
 def _inator_inator(restrict_modules: Optional[list[str]] = None):
@@ -243,35 +216,29 @@ def _inator_inator(restrict_modules: Optional[list[str]] = None):
             x_def_module.startswith(mod) for mod in restrict_modules
         ):
             pass
-        elif instance_init_allowed_for_transform(x, ctx):
-            match recompile_fn_with_transform(
-                x.__init__,
-                _maxray_walker_handler,
-                special_use_instance_type=x,
-                triggered_by_node=ctx,
-            ):
-                case Ok(init_patch):
-                    logger.debug(f"Patching __init__ for class {x}")
-                    setattr(x, "__init__", init_patch)
-                case Err(_err):
-                    set_property_on_functionlike(
-                        x.__init__, "_MAXRAY_NOTRANSFORM", True
-                    )
 
-        elif instance_call_allowed_for_transform(x, ctx):
-            match recompile_fn_with_transform(
-                x.__call__,
-                _maxray_walker_handler,
-                special_use_instance_type=x,
-                triggered_by_node=ctx,
-            ):
-                case Ok(call_patch):
-                    logger.debug(f"Patching __call__ for class {x}")
-                    setattr(x, "__call__", call_patch)
-                case Err(_err):
-                    set_property_on_functionlike(
-                        x.__call__, "_MAXRAY_NOTRANSFORM", True
-                    )
+        elif instance_allowed_for_transform(x, ctx):
+            # TODO: Delay non-init methods until we actually observe an instance?
+            for dunder in ["__init__", "__call__"]:
+                try:
+                    dunder_fn = getattr(x, dunder)
+                    if transform_precheck(dunder_fn, ctx):
+                        match recompile_fn_with_transform(
+                            dunder_fn,
+                            _maxray_walker_handler,
+                            special_use_instance_type=x,
+                            triggered_by_node=ctx,
+                        ):
+                            case Ok(init_patch):
+                                logger.debug(f"Patching {dunder} for class {x}")
+                                setattr(x, dunder, init_patch)
+                            case Err(_err):
+                                # TODO: test that errors are reported somewhere
+                                set_property_on_functionlike(
+                                    dunder_fn, "_MAXRAY_NOTRANSFORM", True
+                                )
+                except AttributeError:
+                    pass
 
         # 1b. normal functions or bound methods or method descriptors like @classmethod and @staticmethod
         elif callable_allowed_for_transform(x, ctx):
