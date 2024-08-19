@@ -703,3 +703,22 @@ def test_global_set():
 
     make_global()
     assert global_y == 101
+
+
+def isna(cls):
+    return 2
+
+
+class Framed:
+    def isna(self):
+        # should call isna in module scope rather than recursing forever into this call
+        return isna(self)
+
+
+def test_qualified_invoke():
+    @xray(dbg)
+    def check_isna():
+        f = Framed()
+        return Framed.isna(f)
+
+    assert check_isna() == 2

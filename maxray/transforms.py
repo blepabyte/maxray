@@ -251,6 +251,7 @@ class FnRewriter(ast.NodeTransformer):
         node = deepcopy(node)
 
         # if self.is_method() and self.is_private_class_name(node.attr):
+        # does the ast.Load() check need to be pulled up here?
         if self.is_private_class_name(node.attr):
             # currently we do a bad job of actually checking if it's supposed to be a method-like so this is just a hopeful guess
             qualname_type_guess = self.fn_context.name.split(".")[-2]
@@ -281,6 +282,15 @@ class FnRewriter(ast.NodeTransformer):
         assert isinstance(new_node, ast.Assign)
         # node = new_node
         # node.value = self.build_transform_node(new_node, f"assign/(multiple)")
+        return node
+
+    def visit_Subscript(self, node: ast.Subscript) -> Any:
+        if isinstance(node.ctx, ast.Load):
+            source_pre = self.recover_source(node)
+            node_pre = deepcopy(node)
+            node = self.generic_visit(node)
+            node = self.build_transform_node(node, "subscript", node_source=source_pre)
+            return ast.copy_location(node, node_pre)
         return node
 
     def visit_Return(self, node: ast.Return) -> Any:
@@ -551,6 +561,18 @@ def recompile_fn_with_transform(
             f"Non-existent source module `{getattr(source_fn, '__module__', None)}` for function {get_fn_name(source_fn)}"
         )
 
+    # A bit hacky: Handle non-"methods" like NDFrame.isna (unbound, not called from instance)
+    if (
+        special_use_instance_type is None
+        and not with_source_fn.method_info.is_inspect_method
+    ):
+        qual_components = with_source_fn.qualname.split(".")
+        match qual_components:
+            case [*_, qual_cls, _fn_name] if hasattr(module, qual_cls):
+                # Pretend it's a method for most purposes
+                # TODO: Update Method data in store for consistency?
+                special_use_instance_type = getattr(module, qual_cls)
+
     try:
         fn_ast = ast.parse(with_source_fn.source)
     except SyntaxError:
@@ -582,8 +604,8 @@ def recompile_fn_with_transform(
                 # Bound method
                 parent_cls = type(original_source_fn.__self__)
 
-        if with_source_fn.method_info.defined_on_cls is not None:
-            parent_cls = with_source_fn.method_info.defined_on_cls
+    if with_source_fn.method_info.defined_on_cls is not None:
+        parent_cls = with_source_fn.method_info.defined_on_cls
 
     # yeah yeah an unbound __init__ isn't actually a method but we can basically treat it as one
     if special_use_instance_type is not None:
@@ -700,14 +722,14 @@ def recompile_fn_with_transform(
     try:
         # TODO: this might be slow
         scope = {
-            **scope_layers["class_local"],
             **scope_layers["core"],
-            # **vars(builtins),
-            # **scope_layers["module"],
             **scope_layers["closure"],
             **scope_layers["override"],
         }
-        scope = BackingDict(scope, backing_layers=[vars(module), vars(builtins)])
+        scope = BackingDict(
+            scope,
+            backing_layers=[vars(module), vars(builtins), scope_layers["class_local"]],
+        )
 
         if not fn_is_method and source_fn.__name__ in scope:
             logger.warning(
@@ -733,44 +755,9 @@ def recompile_fn_with_transform(
         logger.debug(
             f"Transformed code we attempted to compile:\n{FnRewriter.safe_unparse(transformed_fn_ast)}"
         )
-
-        # FALLBACK: in numpy.core.numeric, they define `@set_module` that rewrites __module__ so inspect gives us the wrong module to correctly re-execute the def in
-        # sourcefile is still correct so let's try use `sys.modules`
-
-        file_to_modules = {
-            getattr(mod, "__file__", None): mod for mod in sys.modules.values()
-        }
-        if with_source_fn.source_file in file_to_modules:
-            # Re-executing in a different module: re-declare scope without the previous module (otherwise we get incorrect behaviour like `min` being replaced with `np.amin` in `np.load`)
-            scope = {
-                **scope_layers["class_local"],
-                **vars(builtins),
-                **scope_layers["core"],
-                **vars(file_to_modules[with_source_fn.source_file]),
-                **scope_layers["closure"],
-                **scope_layers["override"],
-            }
-
-            try:
-                exec(
-                    compile(
-                        transformed_fn_ast,
-                        filename=f"<{source_fn.__name__}>",
-                        mode="exec",
-                    ),
-                    scope,
-                    scope,
-                )
-            except Exception as e:
-                logger.exception(e)
-                return with_source_fn.mark_errored(
-                    f"Re-def of function {get_fn_name(source_fn)} in its source file module at {with_source_fn.source_file} also failed"
-                )
-            exit(111)
-        else:
-            return with_source_fn.mark_errored(
-                f"Failed to re-def function {get_fn_name(source_fn)} and its source file {with_source_fn.source_file} was not found in sys.modules"
-            )
+        return with_source_fn.mark_errored(
+            f"{e}: Failed to re-def function {get_fn_name(source_fn)}"
+        )
 
     transformed_fn = scope[fn_rewriter.defined_fn_name]
 
@@ -843,6 +830,7 @@ FILE_TO_SYS_MODULES = {}
 
 
 def lookup_module(fd: FunctionData):
+    # Prefer to match on source file rather than __module__ (which can be overriden arbitrarily, e.g. in numpy.core.numeric, they define `@set_module`)
     if fd.source_file in FILE_TO_SYS_MODULES:
         return FILE_TO_SYS_MODULES[fd.source_file]
 

@@ -58,6 +58,7 @@ def xray(walker, **kwargs):
 
 
 _GLOBAL_SKIP_MODULES = {
+    # Builtins/used internally
     "builtins",  # duh... object.__init__ is a wrapper_descriptor
     "abc",  # excessive inheritance and super calls in scikit-learn
     "inspect",  # don't want to screw this module up
@@ -65,14 +66,15 @@ _GLOBAL_SKIP_MODULES = {
     "re",  # internals of regexp have a lot of uninteresting step methods
     "copy",  # pytorch spends so much time in here
     "functools",  # partialmethod causes mis-bound `self` in TQDM
-    "asyncio",  # AttributeError: 'NoneType' object has no attribute 'new_event_loop'
+    "uuid",  # used for generating _MAXRAY_TRANSFORM_ID
+    # "asyncio",
     "logging",  # global _loggerClass probably causes problems
     "typing",
     "ast",
     "importlib",
     "ctypes",
+    # Libraries not fully working yet
     "loguru",  # used internally in transform - accidental patching will cause inf recursion
-    "uuid",  # used for generating _MAXRAY_TRANSFORM_ID
     "urllib3",
     "aiohttp",  # something icky about web.RouteTableDef() when route decorated from submodule
     "maxray",
