@@ -86,11 +86,67 @@ class NodeContext:
         }
 
 
+class RewriteRuntimeHelper:
+    """
+    Implementation for rewrite functionality that needs to execute code and maintain state at runtime (rather than only applying known AST transforms)
+
+    - `read_*` are called at runtime
+    - `write_*` are called during AST rewrite
+    """
+
+    SYMBOL = "_MAXRAY_REWRITE_RUNTIME"
+
+    def __init__(self, fn_context: FnContext):
+        self.fn_context = fn_context
+
+    def expand_scope(self):
+        # TODO: exclude these methods from being patched/transformed
+        return {
+            self.SYMBOL: self,
+            "_MAXRAY_INNER_NOTRANSFORM": self.read_inner_notransform,
+            "_MAXRAY_PATCH_MRO": self.read_patch_mro,
+        }
+
+    @property
+    def read_locals(self):
+        return builtins.locals
+
+    def write_locals(self):
+        return ast.Call(
+            func=ast.Attribute(
+                ast.Name(id=self.SYMBOL, ctx=ast.Load()), "read_locals", ctx=ast.Load()
+            ),
+            args=[],
+            keywords=[],
+        )
+
+    def read_inner_notransform(self, f):
+        set_property_on_functionlike(f, "_MAXRAY_NOTRANSFORM", True)
+        return f
+
+    def write_inner_notransform(self):
+        return ast.Name("_MAXRAY_INNER_NOTRANSFORM", ctx=ast.Load())
+
+    def read_patch_mro(self, super_type: "super"):  # type: ignore
+        # TODO: use `ctx` to find current method to patch in addition to dunders, also apply actual transform
+        for parent_type in super_type.__self_class__.mro():
+            if not hasattr(parent_type, "__init__") or hasattr(
+                parent_type.__init__, "_MAXRAY_TRANSFORMED"
+            ):  # Seems to have side effects when picked up for patching?
+                continue
+
+        return super_type
+
+    def write_patch_mro(self):
+        return ast.Name("_MAXRAY_PATCH_MRO", ctx=ast.Load())
+
+
 class FnRewriter(ast.NodeTransformer):
     def __init__(
         self,
         transform_fn,
         fn_context: FnContext,
+        runtime_helper: RewriteRuntimeHelper,
         *,
         instance_type: str | None,
         dedent_chars: int = 0,
@@ -104,6 +160,7 @@ class FnRewriter(ast.NodeTransformer):
 
         self.transform_fn = transform_fn
         self.fn_context = fn_context
+        self.runtime_helper = runtime_helper
         self.instance_type = instance_type
         self.dedent_chars = dedent_chars
         self.record_call_counts = record_call_counts
@@ -187,11 +244,12 @@ class FnRewriter(ast.NodeTransformer):
             keyword_args.append(
                 ast.keyword(
                     arg="local_scope",
-                    value=ast.Call(
-                        func=ast.Name(id="_MAXRAY_BUILTINS_LOCALS", ctx=ast.Load()),
-                        args=[],
-                        keywords=[],
-                    ),
+                    value=self.runtime_helper.write_locals(),
+                    # ast.Call(
+                    #     func=ast.Name(id="_MAXRAY_BUILTINS_LOCALS", ctx=ast.Load()),
+                    #     args=[],
+                    #     keywords=[],
+                    # ),
                 )
             )
 
@@ -252,16 +310,19 @@ class FnRewriter(ast.NodeTransformer):
 
         # if self.is_method() and self.is_private_class_name(node.attr):
         # does the ast.Load() check need to be pulled up here?
+        # TODO: support failing/raising an exception if we can't guess any instance name
         if self.is_private_class_name(node.attr):
             # currently we do a bad job of actually checking if it's supposed to be a method-like so this is just a hopeful guess
-            qualname_type_guess = self.fn_context.name.split(".")[-2]
+            qualname_components = self.fn_context.name.split(".")
+            if len(qualname_components) < 2:
+                logger.error(f"{qualname_components} {self.safe_unparse(node)}")
             resolve_type_name = (
                 self.instance_type
                 if self.instance_type is not None
-                else qualname_type_guess
+                else qualname_components[-2]
             )
             node.attr = f"_{resolve_type_name.lstrip('_')}{node.attr}"
-            logger.warning("Replaced with mangled private name")
+            logger.warning(f"Replaced with mangled private name: {node.attr}")
 
         if isinstance(node.ctx, ast.Load):
             node = self.generic_visit(node)
@@ -378,7 +439,7 @@ class FnRewriter(ast.NodeTransformer):
                         ast.Name("cls", ctx=ast.Load()),
                     ]
                 node = ast.Call(
-                    func=ast.Name("_MAXRAY_PATCH_MRO", ctx=ast.Load()),
+                    func=self.runtime_helper.write_patch_mro(),
                     args=[node],
                     keywords=[],
                 )
@@ -431,9 +492,7 @@ class FnRewriter(ast.NodeTransformer):
                 node.name = f"{node.name}_{self.instance_type}_{node.name}"
             self.defined_fn_name = node.name
         else:
-            node.decorator_list.insert(
-                0, ast.Name("_MAXRAY_DECORATE_INNER_NOTRANSFORM", ctx=ast.Load())
-            )
+            node.decorator_list.insert(0, self.runtime_helper.write_inner_notransform())
 
         # Decorators are evaluated sequentially: decorators applied *before* our one (should?) get ignored while decorators applied *after* work correctly
         is_transform_root = self.fn_count == 1 and self.is_maxray_root
@@ -627,10 +686,13 @@ def recompile_fn_with_transform(
         fn_call_counter,
         compile_id=with_source_fn.compile_id,
     )
+    runtime_helper = RewriteRuntimeHelper(fn_context)
+
     instance_type = parent_cls.__name__ if fn_is_method else None
     fn_rewriter = FnRewriter(
         transform_fn,
         fn_context,
+        runtime_helper,
         instance_type=instance_type,
         dedent_chars=with_source_fn.source_dedent_chars,
         pass_locals_on_return=pass_scope,
@@ -642,19 +704,6 @@ def recompile_fn_with_transform(
     if ast_post_callback is not None:
         ast_post_callback(transformed_fn_ast)
 
-    def patch_mro(super_type: super):
-        for parent_type in super_type.__self_class__.mro():
-            # Ok that's weird - this function gets picked up by the maxray decorator and seems to correctly patch the parent types - so despite looking like this function does absolutely nothing, it actually *has* side-effects
-            if not hasattr(parent_type, "__init__") or hasattr(
-                parent_type.__init__, "_MAXRAY_TRANSFORMED"
-            ):
-                continue
-
-        return super_type
-
-    # TODO: does this make a difference? are superclasses even getting patched properly?
-    # patch_mro._MAXRAY_NOTRANSFORM = True
-
     scope_layers = {
         "core": {
             transform_fn.__name__: transform_fn,
@@ -662,12 +711,8 @@ def recompile_fn_with_transform(
             "_MAXRAY_FN_CONTEXT": fn_context,
             "_MAXRAY_CALL_COUNTER": fn_call_counter,
             "_MAXRAY_DECORATE_WITH_COUNTER": count_calls_with,
-            "_MAXRAY_DECORATE_INNER_NOTRANSFORM": ensure_notransform,
-            "_MAXRAY_BUILTINS_LOCALS": locals,
-            "_MAXRAY_PATCH_MRO": patch_mro,
-            "_MAXRAY_MODULE_GLOBALS": vars(
-                module
-            ),  # TODO: on fail need to use different module
+            "_MAXRAY_MODULE_GLOBALS": vars(module),
+            **runtime_helper.expand_scope(),
         },
         "override": override_scope,
         "class_local": {},
@@ -852,8 +897,3 @@ def lookup_module(fd: FunctionData):
         return file_matched
     else:
         return module_matched
-
-
-def ensure_notransform(f):
-    set_property_on_functionlike(f, "_MAXRAY_NOTRANSFORM", True)
-    return f
