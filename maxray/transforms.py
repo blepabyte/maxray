@@ -354,6 +354,17 @@ class FnRewriter(ast.NodeTransformer):
             return ast.copy_location(node, node_pre)
         return node
 
+    def visit_BinOp(self, node: ast.BinOp) -> Any:
+        source_pre = self.recover_source(node)
+        node_pre = deepcopy(node)
+        node = self.generic_visit(node)
+
+        op_name = type(node.op).__name__
+        node = self.build_transform_node(
+            node, f"binop/{op_name}", node_source=source_pre
+        )
+        return ast.copy_location(node, node_pre)
+
     def visit_Return(self, node: ast.Return) -> Any:
         """
         `return` is a non-expression node. Though adding an event on this node is redundant (callback would already be invoked on the expression to be returned), it's still useful to track what was returned or override it.
