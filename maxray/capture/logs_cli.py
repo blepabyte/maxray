@@ -617,6 +617,9 @@ def cli(
             str(capture_to.with_stem(capture_to.stem + "-functions")),
         )
 
+    if _result.exception is not None:
+        exit(1)
+
 
 def run_script():
     cli.main(standalone_mode=False)
