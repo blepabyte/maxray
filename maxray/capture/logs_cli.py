@@ -326,6 +326,11 @@ class ScriptRunner:
         # TODO: remove from path after
         sys.path.extend(self.run_type.extra_sys_path())
 
+        push_main_scope = {
+            "__name__": "__main__",
+            "__file__": self.run_type.sourcemap_to(),
+        }
+
         exc = None
         final_scope = {}
         try:
@@ -336,10 +341,7 @@ class ScriptRunner:
                     if self.restrict_to_source_module
                     else None
                 ),
-                initial_scope={
-                    "__name__": "__main__",
-                    "__file__": self.run_type.sourcemap_to(),
-                },
+                initial_scope=push_main_scope,
             )(self.compile_to_callable())
 
             with CaptureLogs() as cl:

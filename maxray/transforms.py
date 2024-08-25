@@ -141,6 +141,9 @@ class RewriteRuntimeHelper:
         return ast.Name("_MAXRAY_PATCH_MRO", ctx=ast.Load())
 
 
+class RewriteFailed(Exception): ...
+
+
 class FnRewriter(ast.NodeTransformer):
     def __init__(
         self,
@@ -308,19 +311,21 @@ class FnRewriter(ast.NodeTransformer):
         source_pre = self.recover_source(node)
         node = deepcopy(node)
 
-        # if self.is_method() and self.is_private_class_name(node.attr):
         # does the ast.Load() check need to be pulled up here?
-        # TODO: support failing/raising an exception if we can't guess any instance name
         if self.is_private_class_name(node.attr):
             # currently we do a bad job of actually checking if it's supposed to be a method-like so this is just a hopeful guess
-            qualname_components = self.fn_context.name.split(".")
-            if len(qualname_components) < 2:
-                logger.error(f"{qualname_components} {self.safe_unparse(node)}")
-            resolve_type_name = (
-                self.instance_type
-                if self.instance_type is not None
-                else qualname_components[-2]
-            )
+
+            if self.instance_type is not None:
+                resolve_type_name = self.instance_type
+            else:
+                # TODO: replace with runtime getattr
+                qualname_components = self.fn_context.name.split(".")
+                if len(qualname_components) < 2:
+                    raise RewriteFailed(
+                        f"{qualname_components} :: {self.safe_unparse(node)} - couldn't guess a type to unmangle private name"
+                    )
+                resolve_type_name = qualname_components[-2]
+
             node.attr = f"_{resolve_type_name.lstrip('_')}{node.attr}"
             logger.warning(f"Replaced with mangled private name: {node.attr}")
 
@@ -709,7 +714,14 @@ def recompile_fn_with_transform(
         pass_locals_on_return=pass_scope,
         is_maxray_root=is_maxray_root,
     )
-    transformed_fn_ast = fn_rewriter.visit(fn_ast)
+
+    try:
+        transformed_fn_ast = fn_rewriter.visit(fn_ast)
+    except RewriteFailed as rewrite_err:
+        return with_source_fn.mark_errored(
+            f"{rewrite_err}: function rewrite failed in transform"
+        )
+
     ast.fix_missing_locations(transformed_fn_ast)
 
     if ast_post_callback is not None:
@@ -732,8 +744,7 @@ def recompile_fn_with_transform(
     }
 
     # Fix relative imports within functions
-    if override_scope.get("__name__", None) != "__main__":
-        scope_layers["override"]["__package__"] = use_relative_import_root
+    scope_layers["override"]["__package__"] = use_relative_import_root
 
     # BUG: this will NOT work with threading - could use ContextVar if no performance impact?
     def set_temp(state, value):
