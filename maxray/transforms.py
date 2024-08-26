@@ -10,7 +10,7 @@ import inspect
 import sys
 import builtins
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from copy import deepcopy
 from result import Result, Ok, Err
 from contextvars import ContextVar
@@ -68,6 +68,8 @@ class NodeContext:
 
     caller_id: Any = None
 
+    props: dict = field(default_factory=lambda: {})
+
     def __repr__(self):
         return f"{self.fn_context}/{self.id}"
 
@@ -84,6 +86,10 @@ class NodeContext:
                 "call_count": self.fn_context.call_count.get(),
             },
         }
+
+    def _set_assigned(self, targets: list[str]):
+        self.props["assigned"] = {"targets": targets}
+        return self
 
 
 class RewriteRuntimeHelper:
@@ -142,6 +148,31 @@ class RewriteRuntimeHelper:
 
 
 class RewriteFailed(Exception): ...
+
+
+class RewriteTransformCall(ast.Call):
+    @staticmethod
+    def build(
+        transform_func_name: str, source_node, node_context_args, node_context_kwargs
+    ):
+        context_node = ast.Call(
+            func=ast.Name(id=NodeContext.__name__, ctx=ast.Load()),
+            args=node_context_args,
+            keywords=node_context_kwargs,
+        )
+
+        return RewriteTransformCall(
+            func=ast.Name(id=transform_func_name, ctx=ast.Load()),
+            args=[source_node, context_node],
+            keywords=[],
+        )
+
+    def assigned(self, assign_targets: list[str]):
+        self.args[1] = ast.Call(
+            ast.Attribute(self.args[1], "_set_assigned", ctx=ast.Load()),
+            args=[ast.List([ast.Constant(s) for s in assign_targets], ctx=ast.Load())],
+            keywords=[],
+        )
 
 
 class FnRewriter(ast.NodeTransformer):
@@ -248,25 +279,12 @@ class FnRewriter(ast.NodeTransformer):
                 ast.keyword(
                     arg="local_scope",
                     value=self.runtime_helper.write_locals(),
-                    # ast.Call(
-                    #     func=ast.Name(id="_MAXRAY_BUILTINS_LOCALS", ctx=ast.Load()),
-                    #     args=[],
-                    #     keywords=[],
-                    # ),
                 )
             )
 
-        context_node = ast.Call(
-            func=ast.Name(id=NodeContext.__name__, ctx=ast.Load()),
-            args=context_args,
-            keywords=keyword_args,
+        return RewriteTransformCall.build(
+            self.transform_fn.__name__, node, context_args, keyword_args
         )
-        ret = ast.Call(
-            func=ast.Name(id=self.transform_fn.__name__, ctx=ast.Load()),
-            args=[node, context_node],
-            keywords=[],
-        )
-        return ret
 
     def visit_Name(self, node):
         source_pre = self.recover_source(node)
@@ -345,10 +363,12 @@ class FnRewriter(ast.NodeTransformer):
     def visit_Assign(self, node: ast.Assign) -> Any:
         node = deepcopy(node)
         new_node = self.generic_visit(node)
-        assert isinstance(new_node, ast.Assign)
-        # node = new_node
-        # node.value = self.build_transform_node(new_node, f"assign/(multiple)")
-        return node
+        match new_node:
+            case ast.Assign(targets=targets, value=RewriteTransformCall() as rtc):
+                target_reprs = [self.recover_source(t) for t in targets]
+                rtc.assigned(target_reprs)
+
+        return new_node
 
     def visit_Subscript(self, node: ast.Subscript) -> Any:
         if isinstance(node.ctx, ast.Load):
