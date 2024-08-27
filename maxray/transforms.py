@@ -186,7 +186,7 @@ class FnRewriter(ast.NodeTransformer):
         instance_type: str | None,
         dedent_chars: int = 0,
         record_call_counts: bool = True,
-        pass_locals_on_return: bool = False,
+        pass_locals_to_ctx: bool = False,
         is_maxray_root: bool = False,
     ):
         """
@@ -199,7 +199,7 @@ class FnRewriter(ast.NodeTransformer):
         self.instance_type = instance_type
         self.dedent_chars = dedent_chars
         self.record_call_counts = record_call_counts
-        self.pass_locals_on_return = pass_locals_on_return
+        self.pass_locals_to_ctx = pass_locals_to_ctx
         self.is_maxray_root = is_maxray_root
 
         # the first `def` we encounter is the one that we're transforming. Subsequent ones will be nested/within class definitions.
@@ -242,9 +242,7 @@ class FnRewriter(ast.NodeTransformer):
             return self.safe_unparse(pre_node)
         return segment
 
-    def build_transform_node(
-        self, node, label, node_source=None, pass_locals=False, extra_kwargs=None
-    ):
+    def build_transform_node(self, node, label, node_source=None, extra_kwargs=None):
         """
         Builds the "inspection" node that wraps the original source node - passing the (value, context) pair to `transform_fn`.
         """
@@ -275,7 +273,7 @@ class FnRewriter(ast.NodeTransformer):
         if extra_kwargs is not None:
             keyword_args.extend(extra_kwargs)
 
-        if pass_locals:
+        if self.pass_locals_to_ctx:
             keyword_args.append(
                 ast.keyword(
                     arg="local_scope",
@@ -416,7 +414,6 @@ class FnRewriter(ast.NodeTransformer):
             node.value,
             f"return/{value_source_pre}",
             node_source=value_source_pre,
-            pass_locals=self.pass_locals_on_return,
         )
 
         return ast.copy_location(node, node_pre)
@@ -732,7 +729,7 @@ def recompile_fn_with_transform(
         runtime_helper,
         instance_type=instance_type,
         dedent_chars=with_source_fn.source_dedent_chars,
-        pass_locals_on_return=pass_scope,
+        pass_locals_to_ctx=pass_scope,
         is_maxray_root=is_maxray_root,
     )
 

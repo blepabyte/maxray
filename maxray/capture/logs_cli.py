@@ -1,3 +1,4 @@
+from rich.protocol import is_renderable
 from maxray import maxray, NodeContext, _inator_inator
 from maxray.capture.logs import CaptureLogs
 from maxray.capture.exec_sources import ExecSource, DynamicSymbol
@@ -24,6 +25,14 @@ from pathlib import Path
 from types import ModuleType
 
 from rich.console import Console
+from rich.live import Live
+from rich.traceback import Traceback
+from rich.pretty import Pretty
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.table import Table
+from rich.syntax import Syntax
+from rich._inspect import Inspect
 import click
 
 from maxray.transforms import FnContext
@@ -146,7 +155,7 @@ class InstanceWatchHook:
 
     def require_reload(self):
         self.needs_reload.set()
-        self.state_instance = None
+        # self.state_instance = None
 
     def call_latest(self, x, ctx: NodeContext):
         # Lazily import only when actually called
@@ -261,7 +270,7 @@ class ScriptRunner:
     Supports programmatically running Python scripts and modules in a __main__ context with specified maxray transforms applied.
     """
 
-    MAIN_FN_NAME = "maaaaaaaaaaaaaaaaaaaaaaaaaaaain"
+    MAIN_FN_NAME = "maaaaaaain"
 
     run_type: ScriptFromFile | ScriptFromString | ScriptFromModule
     enable_capture: bool = True
@@ -292,7 +301,7 @@ class ScriptRunner:
 
         new_source = f"""def {self.MAIN_FN_NAME}():
 {indent(source, '    ')}
-    return locals()
+    # return locals()
 """
 
         # inspect.getsource relies on the file actually existing
@@ -331,11 +340,12 @@ class ScriptRunner:
             "__file__": self.run_type.sourcemap_to(),
         }
 
-        exc = None
+        exc_tb = None
         final_scope = {}
         try:
             fn = maxray(
                 self.rewrite_node,
+                pass_scope=True,
                 root_inator=_inator_inator(
                     [self.run_type.in_module().__name__]
                     if self.restrict_to_source_module
@@ -349,8 +359,7 @@ class ScriptRunner:
                     final_scope = fn()
 
                 except Exception as e:
-                    dump_on_exception()
-                    exc = e
+                    exc_tb = Traceback.extract(type(e), e, e.__traceback__)
                 finally:
                     # A way to run custom code at the end of a script
                     self.with_decor_inator(
@@ -398,7 +407,7 @@ class ScriptRunner:
             sf_col_idx, functions_table.field(sf_col_idx), remapped_source_file
         )
 
-        return ScriptOutput(cl.collect(), functions_table, exc, final_scope)
+        return ScriptOutput(cl.collect(), functions_table, exc_tb, final_scope)
 
     def rewrite_node(self, x, ctx: NodeContext):
         if ctx.fn_context.source_file == self.temp_sourcefile.name:
@@ -427,6 +436,91 @@ class ScriptRunner:
         return x
 
 
+class InteractiveContext:
+    def __init__(self):
+        self.live = Live(
+            Pretty("Waiting for data to show..."),
+            screen=True,
+            refresh_per_second=5,
+        )
+        self.var_displays = {}
+
+    def dashboard(self):
+        return self.live
+
+    def wrap(self, ctx: NodeContext):
+        self.ctx = ctx
+        return self
+
+    def __getattr__(self, prop):
+        return getattr(self.ctx, prop)
+
+    def show(self, **keys):
+        self.var_displays.update(keys)
+
+    def reset(self):
+        self.var_displays.clear()
+
+    def inspect(self, **objs):
+        self.var_displays.update(
+            {k: Inspect(v, all=False, methods=True, docs=True) for k, v in objs.items()}
+        )
+
+    def current_code(self):
+        ctx = self.ctx
+        offset_line = (
+            ctx.location[0] - ctx.fn_context.line_offset + 3
+        )  # TODO: 3 in main script, 2 elsewhere
+        return Syntax(
+            ctx.fn_context.source,
+            "python",
+            line_numbers=True,
+            line_range=(max(1, offset_line - 5), offset_line + 5),
+            highlight_lines={offset_line},
+        )
+
+    def display(self, x, exception=False):
+        root_layout = Layout()
+        root_layout.split_column(
+            Layout(name="header"), main_layout := Layout(name="content")
+        )
+        root_layout["header"].size = 15
+        header_table = Table(expand=True)
+        header_table.add_column("Code", ratio=2)
+        header_table.add_column("Source", ratio=1)
+        header_table.add_column("Object", ratio=2)
+        header_table.add_row(
+            self.current_code(),
+            self.ctx.source,
+            Pretty("nuh uh"),
+            # Pretty(x),
+        )
+        root_layout["header"].update(header_table)
+
+        if exception:
+            if exception is True:
+                traceback = Traceback(suppress=[sys.modules["maxray.capture"]])
+            else:
+                traceback = Traceback(
+                    exception, suppress=[sys.modules["maxray.capture"]]
+                )
+            left, right = Layout(), Layout(traceback)
+            main_layout.split_row(left, right)
+            main_layout = left
+
+        for k, v in self.var_displays.items():
+            if not is_renderable(v):
+                v = Pretty(v)
+            # TODO: information in panel subtitle?
+
+            push_layout = Layout(Panel(v, title=k))
+            if isinstance(v, Inspect):
+                push_layout.ratio = 4
+            main_layout.add_split(push_layout)
+
+        self.live.update(root_layout)
+
+
 class InteractiveRunner:
     """
     Implements hot-reloading via file-watching
@@ -445,6 +539,8 @@ class InteractiveRunner:
         self.watch_hooks = watch_hooks
         self.loop = loop
 
+        self.interactive_state = InteractiveContext()
+
     def run(self):
         watcher = threading.Thread(target=self.watch_loop, daemon=True)
         # Well, we can't kill a thread so we'll just let it die on program exit...
@@ -453,34 +549,39 @@ class InteractiveRunner:
         # fish: Job 1, 'xpy -w examples/hotreload_obser…' terminated by signal SIGABRT (Abort)
         watcher.start()
 
-        while True:
-            for hook in self.watch_hooks:
-                hook.require_reload()
-            # Exceptions are absorbed into the run output
-            try:
-                result = self.runner.run()
+        with self.interactive_state.dashboard():
+            while True:
+                for hook in self.watch_hooks:
+                    hook.require_reload()
+                # Exceptions are absorbed into the run output
+                try:
+                    result = self.runner.run()
 
-                if not self.loop:
-                    return result
-            except Quit:
-                exit(1)
+                    if result.exception is not None:
+                        self.interactive_state.display(None, exception=result.exception)
 
-            except AbortRun:
-                console.log("[bold red]Run aborted (no results saved).")
-                if not self.loop:
+                    if not self.loop:
+                        return result
+                except Quit:
                     exit(1)
 
-            print("\n" * 2)
-            with console.status(
-                "Iteration in --loop mode completed: [bold green]Watching for source file changes..."
-            ) as _status:
-                console.log("Press Ctrl-C to quit")
+                except AbortRun:
+                    console.log("[bold red]Run aborted (no results saved).")
+                    if not self.loop:
+                        exit(1)
+
+                print("\n" * 2)
+                # with console.status(
+                #     "Iteration in --loop mode completed: [bold green]Watching for source file changes..."
+                # ) as _status:
+                # console.log("Press Ctrl-C to quit")
                 self.block_until_update()
 
     def block_until_update(self):
         """
         Wait until either the script file or one of the watched files is modified.
         """
+        # TODO: print a message here? multiple interact backends required?
         files_to_watch = list(
             itertools.chain.from_iterable(
                 hook.watched.files_to_watch() for hook in self.watch_hooks
@@ -508,28 +609,28 @@ class InteractiveRunner:
                 hook.check_and_update(changed_files)
 
     def apply_interactive_inators(self, x, ctx):
+        ctx = self.interactive_state.wrap(ctx)
+
         for hook in self.watch_hooks:
             try:
                 x = hook.call_latest(x, ctx)
+                continue
             except (AbortRun, Quit):
                 raise
-            except Exception as err:
-                if not isinstance(err, NotImplementedError):
-                    dump_on_exception()
-                else:
-                    console.print("[red]NotImplemented")
+            except Exception:
+                ctx.display(x, exception=True)
 
-                while True:
-                    try:
-                        x = hook.block_call_until_updated(x, ctx)
-                        break
-                    except (AbortRun, Quit):
-                        raise
-                    except Exception as err:
-                        if not isinstance(err, NotImplementedError):
-                            dump_on_exception()
-                        else:
-                            console.print("[red]NotImplemented")
+            # Don't nest in `except` block to avoid "During handling of the above exception" messing up the traceback display
+            while True:
+                try:
+                    x = hook.block_call_until_updated(x, ctx)
+                    break
+                except (AbortRun, Quit):
+                    raise
+                except Exception:
+                    ctx.display(x, exception=True)
+
+        ctx.display(x)
         return x
 
 
