@@ -20,6 +20,14 @@ def increment_ints_by_one(x, ctx):
         return x
 
 
+def convert_ints_to_str(x, ctx):
+    match x:
+        case int():
+            return str(x)
+        case _:
+            return x
+
+
 def test_basic():
     @transform(increment_ints_by_one)
     def f(x):
@@ -41,11 +49,11 @@ def test_type_hints():
 def test_closure_capture():
     z = 1
 
-    @transform(increment_ints_by_one)
+    @transform(convert_ints_to_str)
     def f(x):
         return x + z
 
-    assert f(3) == 7
+    assert f(3) == "31"
 
 
 def test_closure_capture_mutate():
@@ -64,11 +72,11 @@ GLOB_CONST = 5
 
 
 def test_global_capture():
-    @transform(increment_ints_by_one)
+    @transform(convert_ints_to_str)
     def g(x):
         return x + GLOB_CONST
 
-    assert g(3) == 11
+    assert g(3) == "35"
 
 
 def test_nested_def():
@@ -462,14 +470,14 @@ def test_unhashable_callable():
 
 
 def test_junk_annotations():
-    @maxray(increment_ints_by_one)
+    @maxray(convert_ints_to_str)
     def outer():
         def inner(x: ASDF = 0, *, y: SDFSDF = 100) -> AAAAAAAAAAA:
             return x + y
 
         return inner(2)
 
-    assert outer() == 107
+    assert outer() == "2100"
 
 
 def test_call_counts():
@@ -519,13 +527,11 @@ def test_empty_return():
 
 
 def test_scope_passed():
-    found_scope = None
+    found_scope = {}
 
     def get_scope(x, ctx):
         nonlocal found_scope
-        if ctx.local_scope is not None:
-            assert found_scope is None
-            found_scope = ctx.local_scope
+        found_scope.update(ctx.local_scope)
         return x
 
     @xray(get_scope, pass_scope=True)
@@ -722,3 +728,19 @@ def test_qualified_invoke():
         return Framed.isna(f)
 
     assert check_isna() == 2
+
+
+def test_qualified_init():
+    class A:
+        def __init__(self):
+            self.a_prop = 101
+
+    class B(A):
+        def __init__(self):
+            A.__init__(self)
+
+    @xray(dbg)
+    def get_prop():
+        return B().a_prop
+
+    assert get_prop() == 101

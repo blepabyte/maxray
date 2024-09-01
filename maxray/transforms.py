@@ -64,7 +64,8 @@ class NodeContext:
         end_col is the exclusive endpoint of the range
     """
 
-    local_scope: Any = None
+    local_scope: Optional[dict] = None
+    "When `pass_scope` is True, contains the output of `builtins.locals()` evaluated in the scope of the source expression"
 
     caller_id: Any = None
 
@@ -859,7 +860,6 @@ def recompile_fn_with_transform(
     transformed_fn.__qualname__ = source_fn.__qualname__
 
     # way to keep track of which functions we've already transformed
-    transformed_fn._MAXRAY_TRANSFORMED = True
     transformed_fn._MAXRAY_TRANSFORM_ID = with_source_fn.compile_id
     with_source_fn.mark_compiled(transformed_fn)
 

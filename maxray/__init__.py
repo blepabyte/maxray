@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps, _lru_cache_wrapper
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar
 from result import Result, Ok, Err
 
 import os
@@ -58,29 +58,32 @@ def xray(walker, **kwargs):
 
 
 _GLOBAL_SKIP_MODULES = {
-    # Builtins/used internally
-    "builtins",  # duh... object.__init__ is a wrapper_descriptor
-    "abc",  # excessive inheritance and super calls in scikit-learn
-    "inspect",  # don't want to screw this module up
-    "pathlib",  # internally used in transform for checking source file exists
-    "re",  # internals of regexp have a lot of uninteresting step methods
-    "copy",  # pytorch spends so much time in here
-    "functools",  # partialmethod causes mis-bound `self` in TQDM
-    "uuid",  # used for generating _MAXRAY_TRANSFORM_ID
-    # "asyncio",
-    "logging",  # global _loggerClass probably causes problems
+    # Don't patch ourself!
+    "maxray",
+    # Nor core parts of the language or modules we use internally
+    "builtins",
+    "ctypes",
+    "importlib",
+    "inspect",
     "typing",
     "ast",
-    "importlib",
-    "ctypes",
-    # Libraries not fully working yet
+    "pathlib",
+    "uuid",  # used for generating _MAXRAY_TRANSFORM_ID
+    # Uninteresting standard library modules
+    # TODO: probably just skip most of the entire Python standard library...
+    "abc",  # excessive inheritance and super calls in scikit-learn
+    "re",  # internals of regexp have a lot of uninteresting step methods
+    "copy",  # pytorch spends so much time in here
+    "collections",
+    # Libraries that are too weird to correctly patch
+    "pytest",
+    # Libraries possibly not fully working yet
+    "logging",  # global _loggerClass probably causes problems
+    "functools",  # partialmethod causes mis-bound `self` in TQDM
     "loguru",  # used internally in transform - accidental patching will cause inf recursion
     "urllib3",
     "aiohttp",  # something icky about web.RouteTableDef() when route decorated from submodule
-    "maxray",
-    "git",
 }
-# TODO: probably just skip the entire Python standard library...
 
 
 @dataclass
@@ -120,6 +123,13 @@ wrapper_descriptor = type(object.__init__)
 method_wrapper = type(type.__call__.__get__(type))
 
 
+def base_module(obj):
+    qual_module = getattr(obj, "__module__", None)
+    if qual_module is None:
+        return ""
+    return qual_module.split(".")[0]
+
+
 def transform_precheck(x, ctx: NodeContext):
     if not callable(x):
         return False
@@ -145,9 +155,8 @@ def transform_precheck(x, ctx: NodeContext):
         pass
 
     # __module__: The name of the module the function was defined in, or None if unavailable.
-    if getattr(x, "__module__", None) in _GLOBAL_SKIP_MODULES:
+    if base_module(x) in _GLOBAL_SKIP_MODULES:
         return False
-    # TODO: also check ctx.fn_context.module?
 
     return True
 
@@ -156,17 +165,10 @@ def callable_allowed_for_transform(x, ctx: NodeContext):
     if not transform_precheck(x, ctx):
         return False
 
-    module_path = ctx.fn_context.module.split(".")
-    if module_path[0] in _GLOBAL_SKIP_MODULES:
-        return False
-    # TODO: deal with nonhashable objects and callables and other exotic types properly
     return (
         callable(x)  # super() has getset_descriptor instead of proper __dict__
         and hasattr(x, "__dict__")
-        # and "_MAXRAY_TRANSFORMED" not in x.__dict__
-        # since we no longer rely on caching, we don't need to check for __hash__
-        # and callable(getattr(x, "__hash__", None))
-        and getattr(type(x), "__module__", None) not in {"ctypes"}
+        and base_module(type(x)) not in {"ctypes"}
         and (
             inspect.isfunction(x)
             or inspect.ismethod(x)
@@ -179,6 +181,8 @@ def instance_allowed_for_transform(x, ctx: NodeContext):
     """
     Checks if x is a type with dunder methods can be correctly transformed.
     """
+    # Forbid metaclasses as they can arbitrarily modify and replace functions
+    # related SOUNDNESS BUG: function wrapper not applied via decorator - track by patching functools.wraps or tracing?
     if type(x) is not type:
         # Filter out weird stuff that would get through with an isinstance check
         # e.g. loguru: _GeneratorContextManager object is not an iterator (might be a separate bug)
@@ -190,6 +194,7 @@ def instance_allowed_for_transform(x, ctx: NodeContext):
     return True
 
 
+# TODO: this doesn't really make sense: only a single set of traversal settings can be sanely "applied" at a time
 def _inator_inator(restrict_modules: Optional[list[str]] = None):
     """
     Control configuration to determine which, and how, callables get recursively transformed.
@@ -261,7 +266,15 @@ def _inator_inator(restrict_modules: Optional[list[str]] = None):
                         with_fn = FunctionStore.get(x_trans._MAXRAY_TRANSFORM_ID)
 
                         # This does not apply when accessing X.method - only X().method
-                        if inspect.ismethod(x):
+                        if (
+                            inspect.ismethod(x)
+                            and with_fn.data.method_info.is_inspect_method is not True
+                        ):
+                            logger.warning(
+                                "Inconsistent method status - probable result of wrapping or metaclass shenanigans"
+                            )
+                            x_patched = x
+                        elif inspect.ismethod(x):
                             # if with_fn.method is not None:
                             # Two cases: descriptor vs bound method
                             match x.__self__:
@@ -344,6 +357,9 @@ def _inator_inator(restrict_modules: Optional[list[str]] = None):
     return _maxray_walker_handler
 
 
+T = TypeVar("T", bound=Callable)
+
+
 def maxray(
     writer: Callable[[Any, NodeContext], Any],
     skip_modules=frozenset(),
@@ -353,7 +369,7 @@ def maxray(
     pass_scope=False,
     initial_scope={},
     assume_transformed=False,
-):
+) -> Callable[[T], T]:
     """
     A transform that recursively hooks into all further calls made within the function, so that `writer` will (in theory) observe every single expression evaluated by the Python interpreter occurring as part of the decorated function call.
 
@@ -391,7 +407,7 @@ def maxray(
         )
 
         # Fixes `test_double_decorators_with_locals`: repeated transforms are broken because stuffing closures into locals doesn't work the second time around
-        if hasattr(fn, "_MAXRAY_TRANSFORMED") or assume_transformed:
+        if hasattr(fn, "_MAXRAY_TRANSFORM_ID") or assume_transformed:
             fn_transform = fn
         else:
             match recompile_fn_with_transform(
@@ -427,9 +443,19 @@ def maxray(
                 finally:
                     ACTIVE_FLAG.reset(prev_token)
 
-        fn_with_context_update._MAXRAY_TRANSFORMED = True
-        # TODO: set correctly everywhere
-        # fn_with_context_update._MAXRAY_TRANSFORM_ID = ...
+        fn_with_context_update._MAXRAY_TRANSFORM_ID = fn_transform._MAXRAY_TRANSFORM_ID
+
+        # If we're given a bound method we need to return a bound method on the same instance
+        # Can only happen via xray(...)(some_method), not when applied via decorator
+        if inspect.ismethod(fn):
+            parent_cls = fn.__self__
+            if not isinstance(parent_cls, type):
+                parent_cls = type(parent_cls)
+
+            fn_with_context_update = fn_with_context_update.__get__(
+                fn.__self__, parent_cls
+            )
+
         return fn_with_context_update
 
-    return recursive_transform
+    return recursive_transform  # type: ignore

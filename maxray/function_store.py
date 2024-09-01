@@ -194,6 +194,11 @@ class FunctionData:
             reason = "Unable to find source code of function"
         elif (not fd.source_file) or (not Path(fd.source_file).exists()):
             reason = "Unable to find source file of function"
+        elif fd.method_info.is_inspect_method and (
+            type(fd.method_info.instance_cls) is not type
+            or type(fd.method_info.defined_on_cls) is not type
+        ):
+            reason = "Method is on a metaclass"
         elif hasattr(fn, "_MAXRAY_TRANSFORM_ID"):
             reason = (
                 f"Function has already been transformed ({fn._MAXRAY_TRANSFORM_ID})"
@@ -281,6 +286,7 @@ class FunctionStore:
     def collect():
         # TODO: Disable locking by default? (design a better context interface?)
         with FunctionStore.lock:
+            # TODO: use a schema to handle case of zero rows
             return pa.table(
                 pa.array(
                     [
