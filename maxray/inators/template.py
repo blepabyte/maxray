@@ -99,9 +99,10 @@ class Inator:
             # Parse variable assignments
             M = Matcher(x, ctx)
             match M.assigned():
-                case {"df": loss}:
-                    ctx.track(loss=loss)
-
+                # case {"df": df}:
+                #     ctx.track(df=df)
+                case _:
+                    ...
             return M.unpacked()
 
         return x
