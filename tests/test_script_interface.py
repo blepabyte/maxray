@@ -1,4 +1,4 @@
-from maxray.capture import ScriptRunner
+from maxray.runner import ScriptRunner, RunCompleted, RunErrored
 
 from pathlib import Path
 
@@ -11,16 +11,17 @@ def nonzero(x, ctx):
 
 def test_sample_script():
     result_fail = ScriptRunner.run_script(Path(__file__).parent / "sample_script.py")
-    assert not result_fail.completed()
+    assert isinstance(result_fail, RunErrored)
 
     result_ok = ScriptRunner.run_script(
         Path(__file__).parent / "sample_script.py", with_decor_inator=nonzero
     )
-    assert result_ok.completed()
+    assert isinstance(result_ok, RunCompleted)
 
 
 def test_sample_module():
     results = ScriptRunner.run_module("maxray._test_module")
+    assert isinstance(results, RunCompleted)
     assert any(
         "_test_module" in f for f in results.functions_arrow["source_file"].to_pylist()
     )

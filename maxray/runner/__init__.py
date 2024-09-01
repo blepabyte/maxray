@@ -1,22 +1,23 @@
-from rich.protocol import is_renderable
+from contextlib import contextmanager
+from .exec_sources import ExecSource, DynamicSymbol
 from maxray import maxray, NodeContext, _inator_inator
 from maxray.capture.logs import CaptureLogs
-from maxray.capture.exec_sources import ExecSource, DynamicSymbol
+from maxray.transforms import FnContext
 from maxray.function_store import FunctionStore
 
 import pyarrow.compute as pc
-import pyarrow.feather as ft
 import watchfiles
 
 import itertools
 import threading
 import importlib
 import importlib.util
-from pydoc import importfile
 import ast
 from textwrap import indent
 import sys
+import inspect
 import tempfile
+import time
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
 from copy import copy
@@ -24,23 +25,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 
-from rich.console import Console
 from rich.live import Live
-from rich.traceback import Traceback
+from rich.traceback import Traceback, Trace
 from rich.pretty import Pretty
 from rich.layout import Layout
+from rich.text import Text
 from rich.panel import Panel
 from rich.table import Table
 from rich.syntax import Syntax
 from rich._inspect import Inspect
-import click
-
-from maxray.transforms import FnContext
-
-console = Console()
 
 
-class EndOfScript: ...
+MAIN_FN_NAME = "maaaaaaain"
+
+
+# Pauses execution
+class Break(Exception): ...
 
 
 # Should not be caught by any user code
@@ -48,11 +48,7 @@ class AbortRun(BaseException): ...
 
 
 # Should not be caught by any user code
-class Quit(BaseException): ...
-
-
-def dump_on_exception():
-    console.print_exception(show_locals=False, max_frames=22)
+class RestartRun(BaseException): ...
 
 
 def empty_module(module_name: str):
@@ -254,14 +250,24 @@ class ScriptFromString:
 
 
 @dataclass
-class ScriptOutput:
+class RunCompleted:
     logs_arrow: Any
     functions_arrow: Any
-    exception: Any = None
     final_scope: dict = field(default_factory=dict)
 
-    def completed(self):
-        return self.exception is None
+
+@dataclass
+class RunErrored:
+    logs_arrow: Any
+    functions_arrow: Any
+    exception: Exception
+    exception_trace: Trace
+
+
+@dataclass
+class RunAborted:
+    reason: str
+    exception: Optional[BaseException] = None
 
 
 @dataclass
@@ -269,8 +275,6 @@ class ScriptRunner:
     """
     Supports programmatically running Python scripts and modules in a __main__ context with specified maxray transforms applied.
     """
-
-    MAIN_FN_NAME = "maaaaaaain"
 
     run_type: ScriptFromFile | ScriptFromString | ScriptFromModule
     enable_capture: bool = True
@@ -299,7 +303,7 @@ class ScriptRunner:
         # BUG: won't show up in `globals()`
         source = source.replace("global ", "nonlocal ")
 
-        new_source = f"""def {self.MAIN_FN_NAME}():
+        new_source = f"""def {MAIN_FN_NAME}():
 {indent(source, '    ')}
     # return locals()
 """
@@ -323,16 +327,15 @@ class ScriptRunner:
 
         namespace = exec_in_module.__dict__
         exec(compiled_code, namespace)
-        main = namespace[self.MAIN_FN_NAME]
+        main = namespace[MAIN_FN_NAME]
 
         sys.modules[exec_in_module.__name__] = exec_in_module
         main.__module__ = exec_in_module.__name__
         return main
 
-    def run(self):
+    def run(self) -> RunCompleted | RunErrored | RunAborted:
         # Fixes same-directory imports (as the actual script is in some random temp dir)
         prev_sys_path = [*sys.path]
-        # TODO: remove from path after
         sys.path.extend(self.run_type.extra_sys_path())
 
         push_main_scope = {
@@ -340,8 +343,7 @@ class ScriptRunner:
             "__file__": self.run_type.sourcemap_to(),
         }
 
-        exc_tb = None
-        final_scope = {}
+        # Try to evaluate source (e.g. could fail with SyntaxError)
         try:
             fn = maxray(
                 self.rewrite_node,
@@ -353,48 +355,68 @@ class ScriptRunner:
                 ),
                 initial_scope=push_main_scope,
             )(self.compile_to_callable())
-
-            with CaptureLogs() as cl:
-                try:
-                    final_scope = fn()
-
-                except Exception as e:
-                    exc_tb = Traceback.extract(type(e), e, e.__traceback__)
-                finally:
-                    # A way to run custom code at the end of a script
-                    self.with_decor_inator(
-                        EndOfScript(),
-                        NodeContext(
-                            "internal/capture",
-                            "EndOfScript()",
-                            FnContext(
-                                EndOfScript.__init__,
-                                "__init__",
-                                "maxray.capture",
-                                "",
-                                "",
-                                0,
-                                call_count=ContextVar("maxray_call_counter", default=0),
-                                compile_id="00000000-0000-0000-0000-000000000000",
-                            ),
-                            (0, 0, 0, 0),
-                        ),
-                    )
-        except (AbortRun, Quit):
-            # this is the only way to quit the run as `exit` will not work
-            raise
-        except SystemExit:
-            # click gives us no choice because it *insists* on stealing KeyboardInterrupt even in standalone mode and throwing SystemExit
-            pass
-        except BaseException as e:  # IDGAF just quit
-            # Hide stupidly long stack trace on exit (BdbQuit)
-            # TODO: Handle properly
-            dump_on_exception()
-            print(e)
-            exit(1)
-        finally:
+        except KeyboardInterrupt as e:
+            return RunAborted("Signal interrupt", e)
+        except BaseException as e:
             sys.path = prev_sys_path
+            return RunAborted(f"Parse/eval of source {self.run_type} failed", e)
 
+        # HACKY exception logic
+        # click gives us no choice because it *insists* on stealing KeyboardInterrupt even in standalone mode and throwing SystemExit
+        with CaptureLogs() as cl:
+            try:
+                final_scope = fn()
+
+            except Exception as e:
+                exc_trace = Traceback.extract(
+                    type(e), e, e.__traceback__, show_locals=True
+                )
+                return self.run_end_hook(
+                    RunErrored(cl.collect(), self.collect_functions(), e, exc_trace)
+                )
+
+            except (AbortRun, RestartRun) as e:
+                # this is the only way to quit the run as `exit` will not work
+                return RunAborted("User abort", e)
+
+            except KeyboardInterrupt as e:
+                return RunAborted("Signal interrupt", e)
+
+            except SystemExit as e:
+                return RunAborted("Forced exit", e)
+
+            except BaseException as e:
+                return RunAborted("BaseException with unknown intent", e)
+
+        return self.run_end_hook(
+            RunCompleted(cl.collect(), self.collect_functions(), final_scope)
+        )
+
+    def run_end_hook(self, status: RunCompleted | RunErrored):
+        """
+        Run custom code at the end of a script
+        """
+        self.with_decor_inator(
+            status,
+            NodeContext(
+                "maxray/runner",
+                f"{type(status).__name__}(...)",
+                FnContext(
+                    type(status).__init__,
+                    "__init__",
+                    "maxray.runner",
+                    "",
+                    "",
+                    0,
+                    call_count=ContextVar("maxray_call_counter", default=0),
+                    compile_id="00000000-0000-0000-0000-000000000000",
+                ),
+                (0, 0, 0, 0),
+            ),
+        )
+        return status
+
+    def collect_functions(self):
         functions_table = FunctionStore.collect()
         # Patch the correct source file names (temporary -> actual)
         sf_col_idx = functions_table.column_names.index("source_file")
@@ -406,8 +428,7 @@ class ScriptRunner:
         functions_table = functions_table.set_column(
             sf_col_idx, functions_table.field(sf_col_idx), remapped_source_file
         )
-
-        return ScriptOutput(cl.collect(), functions_table, exc_tb, final_scope)
+        return functions_table
 
     def rewrite_node(self, x, ctx: NodeContext):
         if ctx.fn_context.source_file == self.temp_sourcefile.name:
@@ -436,37 +457,78 @@ class ScriptRunner:
         return x
 
 
-class InteractiveContext:
+class BaseInteractiveContext:
+    def display_started(self):
+        raise NotImplementedError()
+
+    def display_end_status(self, status: RunCompleted | RunErrored):
+        raise NotImplementedError()
+
+
+class InteractiveContext(BaseInteractiveContext):
     def __init__(self):
         self.live = Live(
-            Pretty("Waiting for data to show..."),
-            screen=True,
-            refresh_per_second=5,
+            Pretty("Waiting for data to show..."), screen=True, auto_refresh=False
         )
+        self.ctx = None
+        self.status = "[yellow]Running..."
+
         self.var_displays = {}
+        self.tracked = {}
+
+    def copy(self):
+        return self.ctx
+
+    def display_started(self):
+        self.status = "[yellow]Running..."
+        self.display()
+
+    def display_end_status(self, status: RunCompleted | RunErrored | RunAborted):
+        with self.with_display():
+            match status:
+                case RunCompleted():
+                    self.status = "[green]Completed"
+                    self.display()
+                case RunErrored():
+                    self.status = "[red]Errored"
+                    self.clear()
+                    self.display(exception=status.exception_trace)
+                case RunAborted():
+                    self.status = f"[cyan]Aborted ({type(status.exception).__name__})"
+                    self.clear()
+                    self.display()
 
     def dashboard(self):
         return self.live
 
     def wrap(self, ctx: NodeContext):
+        assert isinstance(ctx, NodeContext)
         self.ctx = ctx
         return self
 
     def __getattr__(self, prop):
         return getattr(self.ctx, prop)
 
-    def show(self, **keys):
-        self.var_displays.update(keys)
+    def show(self, obj):
+        self.var_displays["show"] = Pretty(obj)
+        self.display()
 
-    def reset(self):
+    def inspect(self, obj):
+        self.var_displays["inspect"] = Inspect(obj, all=False, methods=True, docs=True)
+        self.display()
+
+    def track(self, **keys):
+        self.tracked.update(keys)
+        self.display()
+
+    def clear(self):
         self.var_displays.clear()
-
-    def inspect(self, **objs):
-        self.var_displays.update(
-            {k: Inspect(v, all=False, methods=True, docs=True) for k, v in objs.items()}
-        )
+        self.tracked.clear()
 
     def current_code(self):
+        if self.ctx is None:
+            return Text("No code for current context")
+
         ctx = self.ctx
         offset_line = (
             ctx.location[0] - ctx.fn_context.line_offset + 3
@@ -479,46 +541,93 @@ class InteractiveContext:
             highlight_lines={offset_line},
         )
 
-    def display(self, x, exception=False):
+    def current_stack(self):
+        # TODO: filter stack properly
+        text = "\n".join(f.function for f in inspect.stack()[7:])
+        return Text(text)
+
+    def current_tracked(self):
+        table = Table(expand=True, title="Tracked objects")
+        table.add_column(
+            "Id",
+            ratio=1,
+        )
+        table.add_column("Object", ratio=4)
+
+        assume_terminal_height = 128
+        row_height = max(5, assume_terminal_height // (len(self.tracked) + 1))
+        # dicts are insertion-ordered: reverse to show newest first (overflow is hidden outside terminal bounds)
+        for k, v in reversed(self.tracked.items()):
+            table.add_row(
+                str(k),
+                Panel(Pretty(v), height=row_height, padding=(0, 0)),
+            )
+        return table
+
+    @contextmanager
+    def with_display(self):
+        try:
+            yield
+        except Exception as e:
+            self.display(exception=True)
+            raise e
+
+    def bsod(self):
+        # When trying to display the dashboard itself errors
+        pass
+
+    def display(self, exception=False):
         root_layout = Layout()
         root_layout.split_column(
             Layout(name="header"), main_layout := Layout(name="content")
         )
         root_layout["header"].size = 15
-        header_table = Table(expand=True)
-        header_table.add_column("Code", ratio=2)
+        header_table = Table(expand=True, title=self.status)
+
+        if self.ctx is None:
+            current_source = ""
+            current_file = "-"
+        else:
+            current_source = self.ctx.source
+            current_file = "/".join(Path(self.ctx.fn_context.source_file).parts[-3:])
+
+        header_table.add_column(current_file, ratio=2)
         header_table.add_column("Source", ratio=1)
-        header_table.add_column("Object", ratio=2)
+        header_table.add_column("Stack", ratio=2)
+
         header_table.add_row(
             self.current_code(),
-            self.ctx.source,
-            Pretty("nuh uh"),
-            # Pretty(x),
+            current_source,
+            self.current_stack(),
         )
         root_layout["header"].update(header_table)
 
         if exception:
             if exception is True:
-                traceback = Traceback(suppress=[sys.modules["maxray.capture"]])
+                traceback = Traceback(suppress=[sys.modules["maxray"]])
             else:
                 traceback = Traceback(
-                    exception, suppress=[sys.modules["maxray.capture"]]
+                    exception,
+                    suppress=[sys.modules["maxray"]],
+                    show_locals=True,
                 )
             left, right = Layout(), Layout(traceback)
             main_layout.split_row(left, right)
             main_layout = left
 
         for k, v in self.var_displays.items():
-            if not is_renderable(v):
-                v = Pretty(v)
-            # TODO: information in panel subtitle?
-
             push_layout = Layout(Panel(v, title=k))
             if isinstance(v, Inspect):
                 push_layout.ratio = 4
             main_layout.add_split(push_layout)
 
+        if self.tracked:
+            push_layout = Layout(self.current_tracked())
+            push_layout.ratio = 4
+            main_layout.add_split(push_layout)
+
         self.live.update(root_layout)
+        self.live.refresh()
 
 
 class InteractiveRunner:
@@ -541,7 +650,7 @@ class InteractiveRunner:
 
         self.interactive_state = InteractiveContext()
 
-    def run(self):
+    def run(self) -> RunCompleted | RunErrored | RunAborted:
         watcher = threading.Thread(target=self.watch_loop, daemon=True)
         # Well, we can't kill a thread so we'll just let it die on program exit...
         # BUG: pthreads stuff...
@@ -549,28 +658,37 @@ class InteractiveRunner:
         # fish: Job 1, 'xpy -w examples/hotreload_obser…' terminated by signal SIGABRT (Abort)
         watcher.start()
 
+        # TODO: swappable interactive backends
         with self.interactive_state.dashboard():
             while True:
+                self.interactive_state.display_started()
+
                 for hook in self.watch_hooks:
                     hook.require_reload()
-                # Exceptions are absorbed into the run output
-                try:
-                    result = self.runner.run()
 
-                    if result.exception is not None:
-                        self.interactive_state.display(None, exception=result.exception)
+                # All exceptions should be absorbed into the run output
+                result = self.runner.run()
+                self.interactive_state.display_end_status(result)
 
-                    if not self.loop:
+                match result:
+                    case RunAborted(exception=AbortRun()):
+                        if self.loop:
+                            self.block_until_update()
+                            continue
+                        else:
+                            return result
+                    case RunAborted(exception=RestartRun()):
+                        continue
+                    case RunAborted():  # general abort
                         return result
-                except Quit:
-                    exit(1)
+                    case _:
+                        pass
 
-                except AbortRun:
-                    console.log("[bold red]Run aborted (no results saved).")
-                    if not self.loop:
-                        exit(1)
+                if not self.loop:
+                    # Delay makes it less confusing when the program immediately exits
+                    time.sleep(2)
+                    return result
 
-                print("\n" * 2)
                 # with console.status(
                 #     "Iteration in --loop mode completed: [bold green]Watching for source file changes..."
                 # ) as _status:
@@ -601,9 +719,6 @@ class InteractiveRunner:
             )
         )
 
-        # for change in watchfiles.watch(
-        #     *files, debug=True, force_polling=False, rust_timeout=100
-        # ):
         for changed_files in watch_files(files):
             for hook in self.watch_hooks:
                 hook.check_and_update(changed_files)
@@ -615,114 +730,19 @@ class InteractiveRunner:
             try:
                 x = hook.call_latest(x, ctx)
                 continue
-            except (AbortRun, Quit):
-                raise
-            except Exception:
-                ctx.display(x, exception=True)
+            except Exception as e:
+                ctx.status = "[violet]PAUSED"
+                # Traceback is unhelpful for breaks - the PAUSED status update suffices
+                ctx.display(exception=not isinstance(e, Break))
 
             # Don't nest in `except` block to avoid "During handling of the above exception" messing up the traceback display
             while True:
                 try:
                     x = hook.block_call_until_updated(x, ctx)
+                    ctx.status = "[yellow]Running..."
+                    ctx.display()
                     break
-                except (AbortRun, Quit):
-                    raise
-                except Exception:
-                    ctx.display(x, exception=True)
+                except Exception as e:
+                    ctx.display(exception=not isinstance(e, Break))
 
-        ctx.display(x)
         return x
-
-
-_DEFAULT_CAPTURE_LOGS_NAME = ".maxray-logs.arrow"
-
-
-@click.command(
-    context_settings=dict(ignore_unknown_options=True, allow_interspersed_args=True)
-)
-@click.argument("script", type=str)
-@click.option("-w", "--watch", type=str, multiple=True)
-@click.option("-W", "--watch-instance", type=str, multiple=True)
-@click.option("-m", "--module", is_flag=True)
-@click.option(
-    "-c",
-    "--capture-default",
-    is_flag=True,
-    help=f"Save the recorded logs to the same folder as the script with the default name [{_DEFAULT_CAPTURE_LOGS_NAME}]",
-)
-@click.option("-C", "--capture", type=str, help="Save the recorded logs to this path")
-@click.option(
-    "-l",
-    "--loop",
-    is_flag=True,
-    help="Won't exit on completion and will wait for a file change event to run the script again.",
-)
-@click.option(
-    "--restrict",
-    is_flag=True,
-    help="Don't recursively patch source code, only tracing code in the immediately invoked script file",
-)
-@click.argument("args", nargs=-1, type=click.UNPROCESSED)
-def cli(
-    script: str,
-    module: bool,
-    watch: tuple,
-    watch_instance: tuple,
-    loop: bool,
-    capture_default: bool,
-    capture: Optional[str],
-    restrict: bool,
-    args,
-):
-    # Reset sys.argv so client scripts don't try to parse our arguments
-    sys.argv = [sys.argv[0], *args]
-
-    if module:
-        run = ScriptFromModule(script)
-    else:
-        run = ScriptFromFile(script)
-
-    hooks = []
-    if watch:
-        hooks.extend(WatchHook.build(spec) for spec in watch)
-    if watch_instance:
-        hooks.extend(InstanceWatchHook.build(spec) for spec in watch_instance)
-
-    run_wrapper = ScriptRunner(
-        run,
-        enable_capture=(capture is not None) or capture_default,
-        restrict_to_source_module=restrict,
-    )
-
-    as_interactive = len(hooks) > 0 or loop
-    if as_interactive:
-        run_wrapper = InteractiveRunner(run_wrapper, hooks, loop=loop)
-
-    _result = run_wrapper.run()
-
-    if capture is not None:
-        capture_to = Path(capture)
-        ft.write_feather(_result.logs_arrow, str(capture_to))
-        ft.write_feather(
-            _result.functions_arrow,
-            str(capture_to.with_stem(capture_to.stem + "-functions")),
-        )
-    elif capture_default:
-        capture_to = (
-            Path(run.sourcemap_to()).resolve(True).parent / _DEFAULT_CAPTURE_LOGS_NAME
-        )
-        ft.write_feather(
-            _result.logs_arrow,
-            str(capture_to),
-        )
-        ft.write_feather(
-            _result.functions_arrow,
-            str(capture_to.with_stem(capture_to.stem + "-functions")),
-        )
-
-    if _result.exception is not None:
-        exit(1)
-
-
-def run_script():
-    cli.main(standalone_mode=False)

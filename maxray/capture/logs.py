@@ -153,7 +153,7 @@ class CaptureLogs:
 
             builder.clear()
 
-        batch = pa.RecordBatch.from_arrays(arrays=arrays, names=names)
+        batch = pa.RecordBatch.from_arrays(arrays=arrays, schema=self.schema())
         if self.save_to is not None:
             self.writer.write(batch)
         else:
