@@ -20,8 +20,8 @@ click = "^8.1.7"
 rich = "^13.7.1"
 
 [tool.poetry.scripts]
-xpy = "maxray.capture.logs_cli:run_script"
-maxray = "maxray.capture.logs_cli:run_script"
+xpy = "maxray.runner.__main__:main"
+maxray = "maxray.runner.__main__:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
