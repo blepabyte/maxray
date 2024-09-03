@@ -90,6 +90,7 @@ def cli(
             # Don't need to make click print a stack trace
             sys.exit(0)
         else:
+            print(run_result.reason)
             sys.exit(2)
 
     if capture is not None:
@@ -113,6 +114,10 @@ def cli(
         )
 
     if isinstance(run_result, RunErrored):
+        import rich
+        from rich.traceback import Traceback
+
+        rich.print(Traceback(run_result.exception_trace))
         sys.exit(1)
 
 
