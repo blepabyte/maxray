@@ -1,5 +1,41 @@
 # CHANGELOG
 
+## v0.5.0 (2024-09-03)
+
+### Chore
+
+* chore: comment out lines in template ([`a6603cb`](https://github.com/blepabyte/maxray/commit/a6603cb3bbe8a3fa56193cf62e0b20d8de687ed9))
+
+### Feature
+
+* feat: print traceback on exit ([`1b04de6`](https://github.com/blepabyte/maxray/commit/1b04de656bb45506ea8dd73ef6c43f64903579ed))
+
+* feat: inator template for source overlays ([`2af8805`](https://github.com/blepabyte/maxray/commit/2af880557cb4ea652c1e34c524251d860bdd2bf6))
+
+* feat: dashboard for interactive watch mode ([`20218d4`](https://github.com/blepabyte/maxray/commit/20218d488452ba89f7df2a2f2b25e77810f7f84c))
+
+* feat: propagate more assignment info in `NodeContext.props` ([`869db4c`](https://github.com/blepabyte/maxray/commit/869db4c1d148a2eb2b6007eade79282b21d4d7ce))
+
+### Fix
+
+* fix: update scripts in pyproject.toml ([`51b6996`](https://github.com/blepabyte/maxray/commit/51b69963d8c4c7c4e28b45b39dfcb89c43da022e))
+
+* fix: forbid metaclasses in transforms ([`c3cafaf`](https://github.com/blepabyte/maxray/commit/c3cafaf635770c1f620455d185da351cb5067460))
+
+* fix: relative imports in modules ([`05ff21b`](https://github.com/blepabyte/maxray/commit/05ff21b6cc713f794806242d4ba21dafce4abf49))
+
+* fix: flag exception state in xpy via return code ([`26d1390`](https://github.com/blepabyte/maxray/commit/26d1390d0275d98d0bcb8368b28f4c96aa444990))
+
+* fix: support BinOp nodes ([`4491a38`](https://github.com/blepabyte/maxray/commit/4491a3869a89234195abf8d0fc91be7358d0e447))
+
+* fix: unbound methods called with correct scope ([`3835f26`](https://github.com/blepabyte/maxray/commit/3835f26e8d2053d547820a1e84d33975a151d9af))
+
+### Refactor
+
+* refactor: logs_cli -&gt; runner module and saner control flow ([`cbddfd5`](https://github.com/blepabyte/maxray/commit/cbddfd5aa285573b42487ab7b7650ff8ead8a093))
+
+* refactor: move runtime impl into RuntimeHelper ([`34694be`](https://github.com/blepabyte/maxray/commit/34694bea2638780a0b377b1779e70283b1e8629a))
+
 ## v0.4.0 (2024-08-15)
 
 ### Chore
