@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from .exec_sources import ExecSource, DynamicSymbol
-from maxray import maxray, NodeContext, _inator_inator
+from maxray import maxray, NodeContext
 from maxray.capture.logs import CaptureLogs
 from maxray.transforms import FnContext
 from maxray.function_store import FunctionStore
@@ -359,7 +359,7 @@ class ScriptRunner:
             fn = maxray(
                 self.rewrite_node,
                 pass_scope=True,
-                root_inator=_inator_inator(
+                restrict_modules=(
                     [self.run_type.in_module().__name__]
                     if self.restrict_to_source_module
                     else None
