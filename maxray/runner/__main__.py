@@ -85,12 +85,11 @@ def cli(
     run_result = run_wrapper.run()
 
     if isinstance(run_result, RunAborted):
+        print(run_result.reason)
         # Nothing to save, immediately exit
         if isinstance(run_result.exception, KeyboardInterrupt):
-            # Don't need to make click print a stack trace
             sys.exit(0)
         else:
-            print(run_result.reason)
             sys.exit(2)
 
     if capture is not None:
@@ -113,12 +112,16 @@ def cli(
             str(capture_to.with_stem(capture_to.stem + "-functions")),
         )
 
-    if isinstance(run_result, RunErrored):
-        import rich
-        from rich.traceback import Traceback
+    match run_result:
+        case RunErrored():
+            import rich
+            from rich.traceback import Traceback
 
-        rich.print(Traceback(run_result.exception_trace))
-        sys.exit(1)
+            rich.print(Traceback(run_result.exception_trace))
+            sys.exit(1)
+
+        case RunCompleted():
+            print("RunCompleted()")
 
 
 def main():

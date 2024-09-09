@@ -21,7 +21,7 @@ rich = "^13.7.1"
 
 [tool.poetry.scripts]
 xpy = "maxray.runner.__main__:main"
-maxray = "maxray.runner.__main__:main"
+maxray = "maxray.__main__:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"

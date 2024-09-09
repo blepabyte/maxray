@@ -19,6 +19,7 @@ class Statefool:
         """
         # Note: can use runtime value for def key for auto grouping!
         ex_o = None
+        # Not thread-safe....
         if key in self._existing_keys:
             ex_v, ex_o = self._existing_keys[key]
             if ex_v >= v:

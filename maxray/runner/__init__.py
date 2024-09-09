@@ -15,25 +15,15 @@ import importlib.util
 import ast
 from textwrap import indent
 import sys
-import inspect
-import tempfile
 import time
+import tempfile
+from contextlib import ExitStack
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
 from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import ModuleType
-
-from rich.live import Live
-from rich.traceback import Traceback, Trace
-from rich.pretty import Pretty
-from rich.layout import Layout
-from rich.text import Text
-from rich.panel import Panel
-from rich.table import Table
-from rich.syntax import Syntax
-from rich._inspect import Inspect
+from types import ModuleType, TracebackType
 
 
 MAIN_FN_NAME = "maaaaaaain"
@@ -141,7 +131,7 @@ class WatchHook:
 @dataclass
 class InstanceWatchHook:
     watched: DynamicSymbol
-    state_instance: Optional[Callable] = None
+    state_instance: Optional[Callable] = None  # Lazily import only when actually called
     needs_reload: threading.Event = field(default_factory=set_event)
 
     def block_call_until_updated(self, x, ctx: NodeContext):
@@ -151,19 +141,40 @@ class InstanceWatchHook:
 
     def require_reload(self):
         self.needs_reload.set()
-        # self.state_instance = None
+
+    def wait_and_reload(self):
+        self.needs_reload.clear()
+        self.needs_reload.wait()
+        self.fetch_latest()
+
+    def fetch_latest(self):
+        if self.state_instance is not None and not self.needs_reload.is_set():
+            return self.state_instance
+
+        # Can handle errors in reload if the instance has been loaded successfully at least once
+        if self.state_instance is not None:
+            while True:
+                with self.state_instance._handle_reload():
+                    state_type = self.watched.load()
+                    break
+                self.needs_reload.clear()
+                self.needs_reload.wait()
+        else:
+            # No error handling
+            state_type = self.watched.load()
+
+        if self.state_instance is None:
+            self.state_instance = state_type()
+        else:
+            # Monkey-patch to preserve state between hot reloads
+            self.state_instance.__class__ = state_type
+
+        self.state_instance.wait_and_reload = self.wait_and_reload
+        self.needs_reload.clear()
+        return self.state_instance
 
     def call_latest(self, x, ctx: NodeContext):
-        # Lazily import only when actually called
-        if self.state_instance is None or self.needs_reload.is_set():
-            state_type = self.watched.load()
-            if self.state_instance is None:
-                self.state_instance = state_type()
-            else:
-                # Monkey-patch to preserve state between hot reloads
-                self.state_instance.__class__ = state_type
-            self.needs_reload.clear()
-        return self.state_instance(x, ctx)
+        return self.fetch_latest()(x, ctx)
 
     def check_and_update(self, changed_files):
         if not self.needs_reload.is_set() and self.watched.is_changed_by_files(
@@ -261,7 +272,7 @@ class RunErrored:
     logs_arrow: Any
     functions_arrow: Any
     exception: Exception
-    exception_trace: Trace
+    traceback: TracebackType
 
 
 @dataclass
@@ -368,11 +379,13 @@ class ScriptRunner:
                 final_scope = fn()
 
             except Exception as e:
-                exc_trace = Traceback.extract(
-                    type(e), e, e.__traceback__, show_locals=True
-                )
                 return self.run_end_hook(
-                    RunErrored(cl.collect(), self.collect_functions(), e, exc_trace)
+                    RunErrored(
+                        cl.collect(),
+                        self.collect_functions(),
+                        e,
+                        e.__traceback__,
+                    )
                 )
 
             except (AbortRun, RestartRun) as e:
@@ -457,179 +470,6 @@ class ScriptRunner:
         return x
 
 
-class BaseInteractiveContext:
-    def display_started(self):
-        raise NotImplementedError()
-
-    def display_end_status(self, status: RunCompleted | RunErrored):
-        raise NotImplementedError()
-
-
-class InteractiveContext(BaseInteractiveContext):
-    def __init__(self):
-        self.live = Live(
-            Pretty("Waiting for data to show..."), screen=True, auto_refresh=False
-        )
-        self.ctx = None
-        self.status = "[yellow]Running..."
-
-        self.var_displays = {}
-        self.tracked = {}
-
-    def copy(self):
-        return self.ctx
-
-    def display_started(self):
-        self.status = "[yellow]Running..."
-        self.display()
-
-    def display_end_status(self, status: RunCompleted | RunErrored | RunAborted):
-        with self.with_display():
-            match status:
-                case RunCompleted():
-                    self.status = "[green]Completed"
-                    self.display()
-                case RunErrored():
-                    self.status = "[red]Errored"
-                    self.clear()
-                    self.display(exception=status.exception_trace)
-                case RunAborted():
-                    self.status = f"[cyan]Aborted ({type(status.exception).__name__})"
-                    self.clear()
-                    self.display()
-
-    def dashboard(self):
-        return self.live
-
-    def wrap(self, ctx: NodeContext):
-        assert isinstance(ctx, NodeContext)
-        self.ctx = ctx
-        return self
-
-    def __getattr__(self, prop):
-        return getattr(self.ctx, prop)
-
-    def show(self, obj):
-        self.var_displays["show"] = Pretty(obj)
-        self.display()
-
-    def inspect(self, obj):
-        self.var_displays["inspect"] = Inspect(obj, all=False, methods=True, docs=True)
-        self.display()
-
-    def track(self, **keys):
-        self.tracked.update(keys)
-        self.display()
-
-    def clear(self):
-        self.var_displays.clear()
-        self.tracked.clear()
-
-    def current_code(self):
-        if self.ctx is None:
-            return Text("No code for current context")
-
-        ctx = self.ctx
-        offset_line = (
-            ctx.location[0] - ctx.fn_context.line_offset + 3
-        )  # TODO: 3 in main script, 2 elsewhere
-        return Syntax(
-            ctx.fn_context.source,
-            "python",
-            line_numbers=True,
-            line_range=(max(1, offset_line - 5), offset_line + 5),
-            highlight_lines={offset_line},
-        )
-
-    def current_stack(self):
-        # TODO: filter stack properly
-        text = "\n".join(f.function for f in inspect.stack()[7:])
-        return Text(text)
-
-    def current_tracked(self):
-        table = Table(expand=True, title="Tracked objects")
-        table.add_column(
-            "Id",
-            ratio=1,
-        )
-        table.add_column("Object", ratio=4)
-
-        assume_terminal_height = 128
-        row_height = max(5, assume_terminal_height // (len(self.tracked) + 1))
-        # dicts are insertion-ordered: reverse to show newest first (overflow is hidden outside terminal bounds)
-        for k, v in reversed(self.tracked.items()):
-            table.add_row(
-                str(k),
-                Panel(Pretty(v), height=row_height, padding=(0, 0)),
-            )
-        return table
-
-    @contextmanager
-    def with_display(self):
-        try:
-            yield
-        except Exception as e:
-            self.display(exception=True)
-            raise e
-
-    def bsod(self):
-        # When trying to display the dashboard itself errors
-        pass
-
-    def display(self, exception=False):
-        root_layout = Layout()
-        root_layout.split_column(
-            Layout(name="header"), main_layout := Layout(name="content")
-        )
-        root_layout["header"].size = 15
-        header_table = Table(expand=True, title=self.status)
-
-        if self.ctx is None:
-            current_source = ""
-            current_file = "-"
-        else:
-            current_source = self.ctx.source
-            current_file = "/".join(Path(self.ctx.fn_context.source_file).parts[-3:])
-
-        header_table.add_column(current_file, ratio=2)
-        header_table.add_column("Source", ratio=1)
-        header_table.add_column("Stack", ratio=2)
-
-        header_table.add_row(
-            self.current_code(),
-            current_source,
-            self.current_stack(),
-        )
-        root_layout["header"].update(header_table)
-
-        if exception:
-            if exception is True:
-                traceback = Traceback(suppress=[sys.modules["maxray"]])
-            else:
-                traceback = Traceback(
-                    exception,
-                    suppress=[sys.modules["maxray"]],
-                    show_locals=True,
-                )
-            left, right = Layout(), Layout(traceback)
-            main_layout.split_row(left, right)
-            main_layout = left
-
-        for k, v in self.var_displays.items():
-            push_layout = Layout(Panel(v, title=k))
-            if isinstance(v, Inspect):
-                push_layout.ratio = 4
-            main_layout.add_split(push_layout)
-
-        if self.tracked:
-            push_layout = Layout(self.current_tracked())
-            push_layout.ratio = 4
-            main_layout.add_split(push_layout)
-
-        self.live.update(root_layout)
-        self.live.refresh()
-
-
 class InteractiveRunner:
     """
     Implements hot-reloading via file-watching
@@ -648,7 +488,25 @@ class InteractiveRunner:
         self.watch_hooks = watch_hooks
         self.loop = loop
 
-        self.interactive_state = InteractiveContext()
+    def default_runner(self):
+        while True:
+            result = yield
+            time.sleep(
+                1
+            )  # Briefly show display to avoid confusion over wtf is going on
+
+            match result:
+                case RunAborted(exception=RestartRun()):
+                    continue
+                case RunAborted(exception=AbortRun()):
+                    ...
+                case RunAborted():  # general abort
+                    return result
+
+            if not self.loop:
+                return result
+
+            self.block_until_update()
 
     def run(self) -> RunCompleted | RunErrored | RunAborted:
         watcher = threading.Thread(target=self.watch_loop, daemon=True)
@@ -658,42 +516,41 @@ class InteractiveRunner:
         # fish: Job 1, 'xpy -w examples/hotreload_obser…' terminated by signal SIGABRT (Abort)
         watcher.start()
 
-        # TODO: swappable interactive backends
-        with self.interactive_state.dashboard():
-            while True:
-                self.interactive_state.display_started()
+        run_generators = []
+        session_stack = ExitStack()
+        for wh in self.watch_hooks:
+            if isinstance(wh, InstanceWatchHook):
+                inator = wh.fetch_latest()
+                session_stack.enter_context(inator.enter_session())
+                try:
+                    run_generators.append(inator.runner())
+                except NotImplementedError:
+                    continue
 
-                for hook in self.watch_hooks:
-                    hook.require_reload()
+        if not run_generators:
+            run_generators = [self.default_runner()]
 
-                # All exceptions should be absorbed into the run output
-                result = self.runner.run()
-                self.interactive_state.display_end_status(result)
+        with session_stack:
+            while run_generators:
+                run_generator = run_generators.pop()
+                try:
+                    next(run_generator)
+                except StopIteration:
+                    continue
 
-                match result:
-                    case RunAborted(exception=AbortRun()):
-                        if self.loop:
-                            self.block_until_update()
-                            continue
-                        else:
-                            return result
-                    case RunAborted(exception=RestartRun()):
-                        continue
-                    case RunAborted():  # general abort
+                while True:
+                    for hook in self.watch_hooks:
+                        hook.require_reload()
+
+                    # All exceptions should be absorbed into the run output
+                    result = self.runner.run()
+
+                    try:
+                        run_generator.send(result)
+                    except StopIteration:
                         return result
-                    case _:
-                        pass
 
-                if not self.loop:
-                    # Delay makes it less confusing when the program immediately exits
-                    time.sleep(2)
-                    return result
-
-                # with console.status(
-                #     "Iteration in --loop mode completed: [bold green]Watching for source file changes..."
-                # ) as _status:
-                # console.log("Press Ctrl-C to quit")
-                self.block_until_update()
+        raise RuntimeError("No runs were yielded")
 
     def block_until_update(self):
         """
@@ -724,25 +581,6 @@ class InteractiveRunner:
                 hook.check_and_update(changed_files)
 
     def apply_interactive_inators(self, x, ctx):
-        ctx = self.interactive_state.wrap(ctx)
-
         for hook in self.watch_hooks:
-            try:
-                x = hook.call_latest(x, ctx)
-                continue
-            except Exception as e:
-                ctx.status = "[violet]PAUSED"
-                # Traceback is unhelpful for breaks - the PAUSED status update suffices
-                ctx.display(exception=not isinstance(e, Break))
-
-            # Don't nest in `except` block to avoid "During handling of the above exception" messing up the traceback display
-            while True:
-                try:
-                    x = hook.block_call_until_updated(x, ctx)
-                    ctx.status = "[yellow]Running..."
-                    ctx.display()
-                    break
-                except Exception as e:
-                    ctx.display(exception=not isinstance(e, Break))
-
+            x = hook.call_latest(x, ctx)
         return x
