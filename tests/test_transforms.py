@@ -33,7 +33,7 @@ def test_basic():
     def f(x):
         return x
 
-    assert f(3) == 5
+    assert f(3) == 4
 
 
 def test_type_hints():
@@ -43,7 +43,7 @@ def test_type_hints():
     def f(x: Any):
         return x
 
-    assert f(3) == 5
+    assert f(3) == 4
 
 
 def test_closure_capture():
@@ -90,8 +90,8 @@ def test_nested_def():
 
         return g
 
-    assert outer()(3) == 5
-    assert outer()(3) == 5
+    assert outer()(3) == 4
+    assert outer()(3) == 4
 
 
 def test_recursive():
@@ -179,7 +179,7 @@ def test_property_access():
     def g():
         return obj.x
 
-    assert g() == 3
+    assert g() == 2
 
 
 def test_method():
@@ -193,7 +193,7 @@ def test_method():
         a = A()
         return a.foo()
 
-    assert g() == "2"
+    assert g() == "3"
 
 
 def test_recursive_self_repr():
@@ -385,12 +385,11 @@ def test_xray_immutable():
     @maxray(lambda x, ctx: x * 10 if isinstance(x, float) else x)
     @xray(increment_ints_by_one)
     def foo():
-        # Currently assumes that literals/constants are not wrapped (they're uninteresting anyways)
         x = 1
         y = 2.0
         return x, y
 
-    assert foo() == (1, 20.0)
+    assert foo() == (1, 200.0)
 
 
 def test_walk_callable_side_effects():
@@ -440,7 +439,7 @@ def test_multi_decorators():
     def f(x):
         return x
 
-    assert f(2) == 4
+    assert f(2) == 3
     assert len(decor_count) == 1
 
     # Works properly when applied last: is wiped for the transform, but is subsequently applied properly to the transformed function
@@ -449,7 +448,7 @@ def test_multi_decorators():
     def f(x):
         return x
 
-    assert f(2) == 0
+    assert f(2) == 1
     assert len(decor_count) == 2
 
 
@@ -624,10 +623,9 @@ def test_super_classmethod():
 
     @maxray(increment_ints_by_one)
     def fff():
-        # S0.foo
         return S1.foo()
 
-    assert fff() == 6
+    assert fff() == 4
 
 
 def test_partialmethod():

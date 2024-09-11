@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 def nonzero(x, ctx):
-    if isinstance(x, int) and x == 0:
+    if ctx.id != "constant" and isinstance(x, int) and x == 0:
         return 1
     return x
 

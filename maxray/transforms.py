@@ -92,6 +92,20 @@ class NodeContext:
         self.props["assigned"] = {"targets": targets}
         return self
 
+    def _set_iterated(self, target: str):
+        self.props["iterated"] = {"target": target}
+        return self
+
+    def _set_returned(self, value_source: str):
+        self.props["returned"] = {"value_source": value_source}
+        return self
+
+    def _set_called(self, call_args, call_kwargs):
+        # TODO: extract args and kwargs for call matching
+        # TODO: bind and pass TRANSFORM_ID if found
+        self.props["called"] = {}
+        return self
+
 
 class RewriteRuntimeHelper:
     """
@@ -172,6 +186,27 @@ class RewriteTransformCall(ast.Call):
         self.args[1] = ast.Call(
             ast.Attribute(self.args[1], "_set_assigned", ctx=ast.Load()),
             args=[ast.List([ast.Constant(s) for s in assign_targets], ctx=ast.Load())],
+            keywords=[],
+        )
+
+    def iterated(self, iter_target: str):
+        self.args[1] = ast.Call(
+            ast.Attribute(self.args[1], "_set_iterated", ctx=ast.Load()),
+            args=[ast.Constant(iter_target)],
+            keywords=[],
+        )
+
+    def returned(self, return_target: str):
+        self.args[1] = ast.Call(
+            ast.Attribute(self.args[1], "_set_returned", ctx=ast.Load()),
+            args=[ast.Constant(return_target)],
+            keywords=[],
+        )
+
+    def called(self, call_args, call_kwargs):
+        self.args[1] = ast.Call(
+            ast.Attribute(self.args[1], "_set_called", ctx=ast.Load()),
+            args=[ast.Constant(None), ast.Constant(None)],
             keywords=[],
         )
 
@@ -353,22 +388,6 @@ class FnRewriter(ast.NodeTransformer):
             )
         return node
 
-    def visit_match_case(self, node: ast.match_case) -> Any:
-        # leave node.pattern unchanged because the rules of match patterns are different from the rest of Python
-        # throws "ValueError: MatchClass cls field can only contain Name or Attribute nodes." in compile because `case _wrap(str()):` doesn't work
-        node.body = [self.generic_visit(child) for child in node.body]
-        return node
-
-    def visit_Assign(self, node: ast.Assign) -> Any:
-        node = deepcopy(node)
-        new_node = self.generic_visit(node)
-        match new_node:
-            case ast.Assign(targets=targets, value=RewriteTransformCall() as rtc):
-                target_reprs = [self.recover_source(t) for t in targets]
-                rtc.assigned(target_reprs)
-
-        return new_node
-
     def visit_Subscript(self, node: ast.Subscript) -> Any:
         if isinstance(node.ctx, ast.Load):
             source_pre = self.recover_source(node)
@@ -377,6 +396,15 @@ class FnRewriter(ast.NodeTransformer):
             node = self.build_transform_node(node, "subscript", node_source=source_pre)
             return ast.copy_location(node, node_pre)
         return node
+
+    def visit_Constant(self, node: ast.Constant) -> Any:
+        source_pre = self.recover_source(node)
+        node_pre = deepcopy(node)
+        new_node = self.generic_visit(node)
+        new_node = self.build_transform_node(
+            new_node, "constant", node_source=source_pre
+        )
+        return ast.copy_location(new_node, node_pre)
 
     def visit_BinOp(self, node: ast.BinOp) -> Any:
         source_pre = self.recover_source(node)
@@ -389,34 +417,48 @@ class FnRewriter(ast.NodeTransformer):
         )
         return ast.copy_location(node, node_pre)
 
+    def visit_match_case(self, node: ast.match_case) -> Any:
+        # leave node.pattern unchanged because the rules of match patterns are different from the rest of Python
+        # throws "ValueError: MatchClass cls field can only contain Name or Attribute nodes." in compile because `case _wrap(str()):` doesn't work
+        node.body = [self.generic_visit(child) for child in node.body]
+        return node
+
+    # Non-expression nodes
+
+    def visit_Assign(self, node: ast.Assign) -> Any:
+        node = deepcopy(node)
+        new_node = self.generic_visit(node)
+        match new_node:
+            case ast.Assign(targets=targets, value=RewriteTransformCall() as rtc):
+                target_reprs = [self.recover_source(t) for t in targets]
+                rtc.assigned(target_reprs)
+
+        return new_node
+
+    def visit_For(self, node: ast.For) -> Any:
+        node = deepcopy(node)
+        new_node = self.generic_visit(node)
+        match new_node:
+            case ast.For(target=target, iter=RewriteTransformCall() as rtc):
+                rtc.iterated(self.recover_source(target))
+
+        return new_node
+
     def visit_Return(self, node: ast.Return) -> Any:
         """
         `return` is a non-expression node. Though adding an event on this node is redundant (callback would already be invoked on the expression to be returned), it's still useful to track what was returned or override it.
         """
-        source_pre = self.recover_source(node)
-        node_pre = deepcopy(node)
-        node = deepcopy(node)
-
-        # Note: For a plain `return` statement, there's no source for a thing that *isn't* returned
-        value_source_pre = (
-            "None" if node.value is None else self.recover_source(node.value)
-        )
-
         if node.value is None:
-            #     # Don't want to invoke a callback on a node that doesn't actually exist
-            node.value = ast.Constant(None)
+            value_source = ""
         else:
-            node = self.generic_visit(node)
+            value_source = self.recover_source(node.value)
 
-        # TODO: Check source locations are correct here
-        ast.fix_missing_locations(node)
-        node.value = self.build_transform_node(
-            node.value,
-            f"return/{value_source_pre}",
-            node_source=value_source_pre,
-        )
+        new_node = self.generic_visit(node)
+        match new_node:
+            case ast.Return(value=RewriteTransformCall() as rtc):
+                rtc.returned(value_source)
 
-        return ast.copy_location(node, node_pre)
+        return new_node
 
     @staticmethod
     def temp_binding(node):
@@ -480,6 +522,11 @@ class FnRewriter(ast.NodeTransformer):
                 ast.fix_missing_locations(node)
 
         node = self.generic_visit(node)
+
+        match node:
+            case ast.Call(func=RewriteTransformCall() as rtc):
+                rtc.called(node.args, node.keywords)
+
         # Want to keep track of which function we're calling
         # Can't do ops on `node_pre.func` beacuse evaluating it has side effects
         # `node.func` is likely a call to `_maxray_walker_handler`
