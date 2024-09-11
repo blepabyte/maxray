@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## v0.6.0 (2024-09-11)
+
+### Feature
+
+* feat: more context props (call, iterate, return) ([`7b51b32`](https://github.com/blepabyte/maxray/commit/7b51b324ccaa03ca789e2a95908c257c9458b6cb))
+
+### Fix
+
+* fix: pass_local_scopes now globally applied ([`7e61361`](https://github.com/blepabyte/maxray/commit/7e61361e93dc3506200f2f64683e0eff8b161b59))
+
+### Refactor
+
+* refactor(runner): display and control flow logic in templates ([`8db73d9`](https://github.com/blepabyte/maxray/commit/8db73d9b669c7226c693235a8a792e66c3846aaf))
+
+* refactor: separate out rich/display from core runner impl ([`cc795cf`](https://github.com/blepabyte/maxray/commit/cc795cf2c2ac1a3ec2c2beb6e6496edef2780c60))
+
 ## v0.5.0 (2024-09-03)
 
 ### Chore
