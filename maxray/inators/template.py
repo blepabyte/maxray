@@ -19,9 +19,7 @@ import rerun as rr
 
 class Inator(BaseInator):
     def __init__(self):
-        super().__init__(
-            name="Inator", rerun=True, auto_debug=True, match_assignments=True
-        )
+        super().__init__(name="Inator", match_assignments=True)
 
     def xray(self, x, ctx: NodeContext):
         S.define_once(
@@ -47,10 +45,12 @@ class Inator(BaseInator):
             case _:
                 ...
 
+        # Based on function scope, dispatch to method implementations
         match ctx.local_scope:
             case {} if ctx.fn_context.name == MAIN_FN_NAME:
                 ...
             case _:
+                # Early return
                 return x
 
         match self.assigned():
@@ -64,21 +64,23 @@ class Inator(BaseInator):
     def runner(self):
         # WARNING: Changes to this function are NOT applied on reload
         # You should modify `match_run_result` below instead
-        while True:
-            # Each iteration yields another run of the program
-            result: RunCompleted | RunAborted | RunErrored = yield
-            match result:
-                case RunAborted(exception=RestartRun()):
-                    continue
-                case RunAborted(exception=AbortRun()):
-                    ...
-                case RunAborted():
-                    return  # Unhandleable error
+        try:
+            while True:
+                # Each iteration yields another run of the program
+                result: RunCompleted | RunAborted | RunErrored = yield
+                match result:
+                    case RunAborted(exception=RestartRun()):
+                        continue
+                    case RunAborted(exception=AbortRun()):
+                        ...
+                    case RunAborted():
+                        return  # Unhandleable error
 
-            self.match_run_result(result)
+                self.match_run_result(result)
 
-        # Cleanup logic either here or in self.enter_session (contextmanager)
-        ...
+        finally:
+            # Cleanup logic either here or in self.enter_session (contextmanager)
+            ...
 
     def match_run_result(self, result: RunCompleted | RunAborted | RunErrored):
         match result:

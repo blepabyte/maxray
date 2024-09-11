@@ -29,22 +29,18 @@ class LocalContext:
 
 
 class BaseInator:
-    def __init__(
-        self, name: str, rerun: bool, auto_debug: bool, match_assignments: bool
-    ):
+    def __init__(self, name: str, match_assignments: bool):
         """
         Args:
         - name (str): Descriptive name for the program. Only used for visualization and logging.
-        - rerun (bool): Whether to auto-init the Rerun visualization library.
         - match_assignments (bool): Enables proper matching on `self.assigned()` by unpacking multiple assignments like `a, b = x`, handling cases where `x` is a stateful iterator or generator by consuming it (converting it to a tuple, throwing away any type information).
         """
         self._name = name
-        self._debugger = auto_debug
         self._match_assignments = match_assignments
         self._display = S.define_once("RICH_LIVE_DISPLAY", lambda _: Display())
 
-        if rerun:
-            rr.init(self._name, spawn=True)
+    def __repr__(self):
+        return self._name
 
     def __call__(self, x, ctx):
         if x is builtins.print:
@@ -77,7 +73,6 @@ class BaseInator:
         match x:
             case RunCompleted() | RunAborted() | RunErrored():
                 self.update_display_state(x)
-                self._display.render()
             case _:
                 self._display.update_status("[yellow]Running...")
                 self._display.render_maybe()
@@ -129,10 +124,12 @@ class BaseInator:
         match state:
             case RunCompleted():
                 self._display.update_status("[green]Completed")
+                self._display.render()
             case RunAborted(exception=exception):
                 self._display.update_status(
                     f"[cyan]Aborted ({type(exception).__name__})"
                 )
+                self._display.render()
             case RunErrored(exception=exception, traceback=traceback):
                 self._display.update_status("[red]Errored")
                 self._display.render_traceback(exception, traceback)

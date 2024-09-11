@@ -65,8 +65,16 @@ class Display:
         self.status_text = "[blue]Initialised"
         self.last_ctx = None
 
+        # Arbitrary renderables like progressbars
+        self.elements = []
+
+        # Inspect(...)
         self.to_inspect = []
+
+        # Pretty(...)
         self.to_show = []
+
+        # Arbitrary keyed values, shown in a table
         self.tracked = {}
 
     def inspect(self, x):
@@ -156,7 +164,12 @@ class Display:
             main_layout.split_row(left, right)
             main_layout = left
 
-        elements = [*self.to_inspect, *self.to_show, *self.render_tracked()]
+        elements = [
+            *self.elements,
+            *self.to_inspect,
+            *self.to_show,
+            *self.render_tracked(),
+        ]
         main_layout.update(Group(*elements))
 
         self.live.update(root_layout)

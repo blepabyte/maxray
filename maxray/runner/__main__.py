@@ -70,7 +70,16 @@ def cli(
     if watch:
         hooks.extend(WatchHook.build(spec) for spec in watch)
     if watch_instance:
-        hooks.extend(InstanceWatchHook.build(spec) for spec in watch_instance)
+        for spec in watch_instance:
+            if spec == "-":
+                overlay_script = (
+                    (script_path := Path(script))
+                    .resolve(True)
+                    .with_name(f"over_{script_path.name}")
+                )
+                hooks.append(InstanceWatchHook.build(f"{overlay_script}:Inator"))
+            else:
+                hooks.append(InstanceWatchHook.build(spec))
 
     run_wrapper = ScriptRunner(
         run,
