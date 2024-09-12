@@ -205,7 +205,7 @@ class FunctionData:
             )
         else:
             try:
-                fn._MAXRAY_TRANSFORM_ID = fd.compile_id
+                fn._PRE_MAXRAY_TRANSFORM_ID = fd.compile_id
                 fd.id_setattr_ok = True
             except AttributeError:
                 fd.id_setattr_ok = False

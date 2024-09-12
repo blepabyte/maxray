@@ -673,8 +673,8 @@ def test_caller_id():
 
     func()
 
-    assert f1._MAXRAY_TRANSFORM_ID == f1_id
-    assert f2._MAXRAY_TRANSFORM_ID == f2_id
+    assert f1._PRE_MAXRAY_TRANSFORM_ID == f1_id
+    assert f2._PRE_MAXRAY_TRANSFORM_ID == f2_id
     assert f1_id != f2_id
 
 
@@ -742,3 +742,32 @@ def test_qualified_init():
         return B().a_prop
 
     assert get_prop() == 101
+
+
+def test_staticmethod_patched():
+    class C:
+        @staticmethod
+        def foo():
+            return "a"
+
+        def bar(self):
+            return "f"
+
+    @maxray(lambda x, ctx: f"{x}{x}" if isinstance(x, str) else x)
+    def call_foo():
+        c1 = C.foo()
+        c2 = C.foo()
+        return c1, c2
+
+    @maxray(lambda x, ctx: f"{x}{x}" if isinstance(x, str) else x)
+    def call_bar():
+        c = C()
+        c1 = c.bar()
+        c2 = c.bar()
+        return c1, c2
+
+    c1, c2 = call_foo()
+    assert c1 == c2
+
+    b1, b2 = call_bar()
+    assert b1 == b2
