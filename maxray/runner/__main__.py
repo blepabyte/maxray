@@ -42,6 +42,12 @@ _DEFAULT_CAPTURE_LOGS_NAME = ".maxray-logs.arrow"
     help="Won't exit on completion and will wait for a file change event to run the script again.",
 )
 @click.option(
+    "-p",
+    "--preserve",
+    is_flag=True,
+    help="Don't apply value transformations (e.g. automatically unpacking assignments to allow matching)",
+)
+@click.option(
     "--restrict",
     is_flag=True,
     help="Don't recursively patch source code, only tracing code in the immediately invoked script file",
@@ -56,6 +62,7 @@ def cli(
     capture_default: bool,
     capture: Optional[str],
     restrict: bool,
+    preserve: bool,
     args,
 ):
     # Reset sys.argv so client scripts don't try to parse our arguments
@@ -89,7 +96,9 @@ def cli(
 
     as_interactive = len(hooks) > 0 or loop
     if as_interactive:
-        run_wrapper = InteractiveRunner(run_wrapper, hooks, loop=loop)
+        run_wrapper = InteractiveRunner(
+            run_wrapper, hooks, loop=loop, unpack_assignments=not preserve
+        )
 
     run_result = run_wrapper.run()
 
@@ -126,7 +135,19 @@ def cli(
             import rich
             from rich.traceback import Traceback
 
-            rich.print(Traceback(run_result.exception_trace))
+            exc_trace = Traceback.extract(
+                type(run_result.exception),
+                run_result.exception,
+                run_result.traceback,
+                show_locals=True,
+            )
+            traceback = Traceback(
+                exc_trace,
+                suppress=[sys.modules["maxray"]],
+                show_locals=True,
+                max_frames=5,
+            )
+            rich.print(traceback)
             sys.exit(1)
 
         case RunCompleted():

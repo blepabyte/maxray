@@ -1,4 +1,4 @@
-from maxray.inators.core import S
+from maxray.inators.core import S, Ray
 from maxray.inators.base import BaseInator
 from maxray.runner import (
     MAIN_FN_NAME,
@@ -9,7 +9,6 @@ from maxray.runner import (
     RestartRun,
     Break,
 )
-from maxray import NodeContext
 
 from uuid import uuid4
 from contextlib import contextmanager
@@ -18,19 +17,17 @@ import rerun as rr
 
 
 class Inator(BaseInator):
-    def __init__(self):
-        super().__init__(name="Inator", match_assignments=True)
-
-    def xray(self, x, ctx: NodeContext):
+    def xray(self, x, ray: Ray):
         S.define_once(
             "RERUN_INSTANCE",
             lambda _: rr.init(f"{self}", spawn=True, recording_id=str(uuid4())),
             v=1,
         )
 
-    def maxray(self, x, ctx: NodeContext):
-        # Manual control flow
+    def maxray(self, x, ray: Ray):
+        ctx = ray.ctx
 
+        # Manual control flow
         # exit()
         # raise Break()
         # raise AbortRun()
@@ -45,17 +42,13 @@ class Inator(BaseInator):
             case _:
                 ...
 
-        # Based on function scope, dispatch to method implementations
-        match ctx.local_scope:
-            case {} if ctx.fn_context.name == MAIN_FN_NAME:
+        match ray.locals():
+            case {}:
                 ...
-            case _:
-                # Early return
-                return x
 
-        match self.assigned():
+        match ray.assigned():
             case {"df": df}:
-                self.display(df)
+                S.display(df)
             case _:
                 ...
 
@@ -87,6 +80,8 @@ class Inator(BaseInator):
             case RunCompleted():
                 ...
             case RunErrored():
-                self.enter_debugger(post_mortem=result)
+                with S.display.hidden():
+                    result.show_traceback()
+                    S.enter_debugger(post_mortem=result.traceback)
 
         self.wait_and_reload()

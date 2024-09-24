@@ -669,6 +669,7 @@ class FnRewriter(ast.NodeTransformer):
         return self.transform_function_def(node)
 
 
+# TODO: this could just be a collections.ChainMap
 class BackingDict(dict):
     """
     We want the scope of a function to be "its module scope" + "a bunch of stuff we define on top of it" - but having scope = {**vars(), **stuff} results in changes to the module not being reflected within the scope.

@@ -1,9 +1,9 @@
-from contextlib import contextmanager
 from .exec_sources import ExecSource, DynamicSymbol
 from maxray import maxray, NodeContext
 from maxray.capture.logs import CaptureLogs
 from maxray.transforms import FnContext
 from maxray.function_store import FunctionStore
+from maxray.inators.core import Ray
 
 import pyarrow.compute as pc
 import watchfiles
@@ -96,23 +96,23 @@ def watch_files(file_paths):
 @dataclass
 class WatchHook:
     watched: DynamicSymbol
-    last_inator: Callable = lambda x, ctx: x
+    last_inator: Callable = lambda x, ray: x
     needs_reload: threading.Event = field(default_factory=set_event)
 
-    def block_call_until_updated(self, x, ctx: NodeContext):
+    def block_call_until_updated(self, x, ray: Ray):
         self.needs_reload.clear()
         self.needs_reload.wait()
-        return self.call_latest(x, ctx)
+        return self.call_latest(x, ray)
 
     def require_reload(self):
         self.needs_reload.set()
 
-    def call_latest(self, x, ctx: NodeContext):
+    def call_latest(self, x, ray: Ray):
         # Lazily import only when actually called
         if self.needs_reload.is_set():
             self.last_inator = self.watched.load()
             self.needs_reload.clear()
-        return self.last_inator(x, ctx)
+        return self.last_inator(x, ray)
 
     def check_and_update(self, changed_files):
         if not self.needs_reload.is_set() and self.watched.is_changed_by_files(
@@ -134,10 +134,10 @@ class InstanceWatchHook:
     state_instance: Optional[Callable] = None  # Lazily import only when actually called
     needs_reload: threading.Event = field(default_factory=set_event)
 
-    def block_call_until_updated(self, x, ctx: NodeContext):
+    def block_call_until_updated(self, x, ray: Ray):
         self.needs_reload.clear()
         self.needs_reload.wait()
-        return self.call_latest(x, ctx)
+        return self.call_latest(x, ray)
 
     def require_reload(self):
         self.needs_reload.set()
@@ -173,8 +173,8 @@ class InstanceWatchHook:
         self.needs_reload.clear()
         return self.state_instance
 
-    def call_latest(self, x, ctx: NodeContext):
-        return self.fetch_latest()(x, ctx)
+    def call_latest(self, x, ray: Ray):
+        return self.fetch_latest()(x, ray)
 
     def check_and_update(self, changed_files):
         if not self.needs_reload.is_set() and self.watched.is_changed_by_files(
@@ -273,6 +273,24 @@ class RunErrored:
     functions_arrow: Any
     exception: Exception
     traceback: TracebackType
+
+    def show_traceback(self):
+        import rich
+        from rich.traceback import Traceback
+
+        exc_trace = Traceback.extract(
+            type(self.exception),
+            self.exception,
+            self.traceback,
+            show_locals=True,
+        )
+        traceback = Traceback(
+            exc_trace,
+            suppress=[sys.modules["maxray"]],
+            show_locals=True,
+            max_frames=5,
+        )
+        rich.print(traceback)
 
 
 @dataclass
@@ -479,7 +497,9 @@ class InteractiveRunner:
         self,
         runner: ScriptRunner,
         watch_hooks: list[WatchHook],
-        loop: bool = False,
+        *,
+        loop: bool,
+        unpack_assignments: bool,
     ):
         self.runner = runner
         self.runner.with_decor_inator = self.apply_interactive_inators
@@ -487,6 +507,7 @@ class InteractiveRunner:
 
         self.watch_hooks = watch_hooks
         self.loop = loop
+        self.unpack_assignments = unpack_assignments
 
     def default_runner(self):
         while True:
@@ -581,6 +602,9 @@ class InteractiveRunner:
                 hook.check_and_update(changed_files)
 
     def apply_interactive_inators(self, x, ctx):
-        for hook in self.watch_hooks:
-            x = hook.call_latest(x, ctx)
+        ray = Ray(x, ctx, unpack_assignments=self.unpack_assignments)
+        with ray._bind(x, ctx):
+            x = ray.value()
+            for hook in self.watch_hooks:
+                x = hook.call_latest(x, ray)
         return x

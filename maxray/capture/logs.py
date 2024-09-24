@@ -185,6 +185,7 @@ class CaptureLogs:
             self.write_context.__exit__(exc_type, exc_val, exc_tb)
 
     def collect(self):
+        self.flush()
         return pa.Table.from_batches(self.in_memory_batches, schema=self.schema())
 
     @staticmethod

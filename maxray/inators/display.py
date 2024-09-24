@@ -56,12 +56,13 @@ class Display:
     Contains state and builds the rich renderable to be shown in the `Live` view.
     """
 
-    def __init__(self):
+    def __init__(self, update_ms=500):
         self.live = Live(
             Pretty("Waiting for data to show..."), screen=True, auto_refresh=False
         )
         self.live.start()  # Only start on first use
         self.last_display_tick = time.perf_counter()
+        self.update_ms = update_ms
         self.status_text = "[blue]Initialised"
         self.last_ctx = None
 
@@ -93,8 +94,9 @@ class Display:
         try:
             self.live.stop()
             yield
-        finally:
+            # not in the finally block because display can screw up terminal state on exit
             self.live.start()
+        finally:
             self.render()
 
     def clear(self):
@@ -106,7 +108,9 @@ class Display:
         self.tracked.update(keys)
 
     def render_maybe(self):
-        if (tick := time.perf_counter()) - self.last_display_tick > 0.1:
+        if (
+            tick := time.perf_counter()
+        ) - self.last_display_tick > self.update_ms / 1000:
             self.last_display_tick = tick
             self.render()
 
@@ -122,7 +126,7 @@ class Display:
             max_frames=5,
         )
 
-        exc_cause = trace.stacks[-1]
+        exc_cause = trace.stacks[0]
         self.status_text = f"[red]PAUSED ON ERROR ({exc_cause.exc_type})\n[orange3]{exc_cause.exc_value})"
         self.render(traceback)
 
