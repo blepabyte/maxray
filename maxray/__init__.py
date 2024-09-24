@@ -144,8 +144,20 @@ _GLOBAL_WRITER_ACTIVE_FLAG = ContextVar("writer_active (global)", default=False)
 # TODO: add cache by source code location?
 _MAXRAY_FN_CACHE = dict()
 
+_MAXRAY_NOCOMPILE = False
+
 wrapper_descriptor = type(object.__init__)
 method_wrapper = type(type.__call__.__get__(type))
+
+
+@contextmanager
+def nocompile():
+    global _MAXRAY_NOCOMPILE
+    _MAXRAY_NOCOMPILE = True
+    try:
+        yield
+    finally:
+        _MAXRAY_NOCOMPILE = False
 
 
 def full_module(obj):
@@ -165,6 +177,10 @@ def transform_precheck(x, ctx: NodeContext):
 
     if isinstance(x, type):  # Not a function
         # Also, we want __getattribute__ to be the bound method for an instance
+        return False
+
+    if type(x).__module__ == "types":
+        # types.GenericAlias behaves like a type despite not being an instance of type...
         return False
 
     if isinstance(x, (wrapper_descriptor, method_wrapper)):
@@ -242,7 +258,10 @@ def instance_allowed_for_transform(x, ctx: NodeContext):
 def _maxray_walker_handler(x, ctx: NodeContext):
     # 1.  logic to recursively patch callables
     # 1a. special-case callables: __init__ and __call__
-    if instance_allowed_for_transform(x, ctx):
+    if _MAXRAY_NOCOMPILE:
+        # TODO: check cache at least?
+        ...
+    elif instance_allowed_for_transform(x, ctx):
         # TODO: Delay non-init methods until we actually observe an instance?
         for dunder in ["__init__", "__call__"]:
             try:

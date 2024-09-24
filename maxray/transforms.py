@@ -106,6 +106,12 @@ class NodeContext:
         self.props["called"] = {}
         return self
 
+    def _set_entered(self, source, as_var):
+        self.props["entered"] = {"source": source}
+        if as_var is not None:
+            self.props["entered"]["as_var"] = as_var
+        return self
+
 
 class RewriteRuntimeHelper:
     """
@@ -128,9 +134,10 @@ class RewriteRuntimeHelper:
             "_MAXRAY_PATCH_MRO": self.read_patch_mro,
         }
 
-    @property
     def read_locals(self):
-        return builtins.locals
+        # This will work properly only from Python 3.13, returning a proper (mutable) view instead of a copy
+        # See [PEP667](https://peps.python.org/pep-0667/)
+        return sys._getframe(1).f_locals
 
     def write_locals(self):
         return ast.Call(
@@ -207,6 +214,13 @@ class RewriteTransformCall(ast.Call):
         self.args[1] = ast.Call(
             ast.Attribute(self.args[1], "_set_called", ctx=ast.Load()),
             args=[ast.Constant(None), ast.Constant(None)],
+            keywords=[],
+        )
+
+    def entered(self, source, as_var):
+        self.args[1] = ast.Call(
+            ast.Attribute(self.args[1], "_set_entered", ctx=ast.Load()),
+            args=[ast.Constant(source), ast.Constant(as_var)],
             keywords=[],
         )
 
@@ -422,6 +436,19 @@ class FnRewriter(ast.NodeTransformer):
         # throws "ValueError: MatchClass cls field can only contain Name or Attribute nodes." in compile because `case _wrap(str()):` doesn't work
         node.body = [self.generic_visit(child) for child in node.body]
         return node
+
+    def visit_withitem(self, node: ast.withitem) -> Any:
+        node = deepcopy(node)
+        new_node = self.generic_visit(node)
+        match new_node:
+            case ast.withitem(context_expr=RewriteTransformCall() as rtc):
+                if node.optional_vars is None:
+                    as_var = None
+                else:
+                    as_var = self.recover_source(node.optional_vars)
+                rtc.entered(self.recover_source(node.context_expr), as_var)
+
+        return new_node
 
     # Non-expression nodes
 
