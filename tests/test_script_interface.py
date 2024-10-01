@@ -1,10 +1,11 @@
+from maxray.nodes import RayContext
 from maxray.runner import ScriptRunner, RunCompleted, RunErrored
 
 from pathlib import Path
 
 
-def nonzero(x, ctx):
-    if ctx.id != "constant" and isinstance(x, int) and x == 0:
+def nonzero(x, ray: RayContext):
+    if ray.ctx.id != "constant" and isinstance(x, int) and x == 0:
         return 1
     return x
 

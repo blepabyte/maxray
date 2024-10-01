@@ -1,6 +1,5 @@
 from maxray import transform, xray, maxray
-from maxray.transforms import NodeContext
-from maxray.walkers import dbg
+from maxray.nodes import NodeContext, RayContext
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,14 +12,18 @@ from loguru import logger
 logger.enable("maxray")
 
 
-def increment_ints_by_one(x, ctx):
+def dbg(x, ray):
+    return x
+
+
+def increment_ints_by_one(x, ray: RayContext):
     if isinstance(x, int):
         return x + 1
     else:
         return x
 
 
-def convert_ints_to_str(x, ctx):
+def convert_ints_to_str(x, ray: RayContext):
     match x:
         case int():
             return str(x)
@@ -158,7 +161,7 @@ def oop():
 
 
 def test_contextmanager():
-    @maxray(lambda x, ctx: x * 2 if isinstance(x, int) else x)
+    @maxray(lambda x, ray: x * 2 if isinstance(x, int) else x)
     def f():
         with oop() as x:
             pass
@@ -188,7 +191,7 @@ def test_method():
             x = 1
             return str(x)
 
-    @maxray(lambda x, ctx: (print(x), x + 1)[-1] if isinstance(x, int) else x)
+    @maxray(lambda x, ray: (print(x), x + 1)[-1] if isinstance(x, int) else x)
     def g():
         a = A()
         return a.foo()
@@ -382,7 +385,7 @@ def test_double_decorators_with_locals():
 
 
 def test_xray_immutable():
-    @maxray(lambda x, ctx: x * 10 if isinstance(x, float) else x)
+    @maxray(lambda x, ray: x * 10 if isinstance(x, float) else x)
     @xray(increment_ints_by_one)
     def foo():
         x = 1
@@ -395,7 +398,7 @@ def test_xray_immutable():
 def test_walk_callable_side_effects():
     counter = 0
 
-    def slide(x, ctx):
+    def slide(x, ray):
         nonlocal counter
         if callable(x):
             counter += 1
@@ -412,7 +415,7 @@ def test_walk_callable_side_effects():
 
 
 def test_match():
-    @maxray(lambda x, ctx: x * 2 if isinstance(x, str) else x)
+    @maxray(lambda x, ray: x * 2 if isinstance(x, str) else x)
     def matcher(x):
         match x:
             case int():
@@ -444,7 +447,7 @@ def test_multi_decorators():
 
     # Works properly when applied last: is wiped for the transform, but is subsequently applied properly to the transformed function
     @dec
-    @maxray(lambda x, ctx: x - 1 if isinstance(x, int) else x)
+    @maxray(lambda x, ray: x - 1 if isinstance(x, int) else x)
     def f(x):
         return x
 
@@ -482,8 +485,8 @@ def test_junk_annotations():
 def test_call_counts():
     calls = []
 
-    def track_call_counts(x, ctx: NodeContext):
-        calls.append(ctx.fn_context.call_count.get())
+    def track_call_counts(x, ray: RayContext):
+        calls.append(ray.ctx.fn_context.call_count.get())
         return x
 
     @xray(track_call_counts)
@@ -501,7 +504,8 @@ def test_call_counts():
 def test_call_counts_recursive():
     calls = []
 
-    def track_call_counts(x, ctx: NodeContext):
+    def track_call_counts(x, ray: RayContext):
+        ctx = ray.ctx
         if ctx.id in ["name/f", "call/f(x - 1)"]:
             calls.append(ctx.fn_context.call_count.get())
         return x
@@ -528,9 +532,9 @@ def test_empty_return():
 def test_scope_passed():
     found_scope = {}
 
-    def get_scope(x, ctx):
+    def get_scope(x, ray):
         nonlocal found_scope
-        found_scope.update(ctx.local_scope)
+        found_scope.update(ray.ctx.local_scope)
         return x
 
     @xray(get_scope, pass_scope=True)
@@ -652,13 +656,16 @@ def test_caller_id():
     f1_id = None
     f2_id = None
 
-    def collect_ids(x, ctx: NodeContext):
-        if ctx.source == "f1()":
-            nonlocal f1_id
-            f1_id = ctx.caller_id
-        elif ctx.source == "f2()":
-            nonlocal f2_id
-            f2_id = ctx.caller_id
+    def collect_ids(x, ray: RayContext):
+        match ray.called():
+            case {"target": "f1"}:
+                nonlocal f1_id
+                f1_id = x._MAXRAY_TRANSFORM_ID
+            case {"target": "f2"}:
+                nonlocal f2_id
+                f2_id = x._MAXRAY_TRANSFORM_ID
+            case _:
+                pass
 
     def f1():
         return 1
@@ -753,13 +760,13 @@ def test_staticmethod_patched():
         def bar(self):
             return "f"
 
-    @maxray(lambda x, ctx: f"{x}{x}" if isinstance(x, str) else x)
+    @maxray(lambda x, ray: f"{x}{x}" if isinstance(x, str) else x)
     def call_foo():
         c1 = C.foo()
         c2 = C.foo()
         return c1, c2
 
-    @maxray(lambda x, ctx: f"{x}{x}" if isinstance(x, str) else x)
+    @maxray(lambda x, ray: f"{x}{x}" if isinstance(x, str) else x)
     def call_bar():
         c = C()
         c1 = c.bar()

@@ -1,4 +1,5 @@
-from .transforms import recompile_fn_with_transform, NodeContext
+from .nodes import NodeContext, RayContext
+from .transforms import recompile_fn_with_transform
 from .function_store import FunctionStore, set_property_on_functionlike
 
 import inspect
@@ -106,7 +107,14 @@ class TransformSettings:
     Whether to always populate `NodeContext.local_scope` with the evaluation of `locals()` at every node.
     """
 
-    def update(self, forbid_modules, restrict_modules, pass_local_scopes):
+    preserve_values: bool = True
+    """
+    If False, will attempt to unpack/destructure `x` values to support pattern matching features.
+    """
+
+    def update(
+        self, forbid_modules, restrict_modules, pass_local_scopes, preserve_values
+    ):
         def or_empty_set(s):
             return frozenset([] if s is None else s)
 
@@ -119,6 +127,7 @@ class TransformSettings:
             forbid_modules=self.forbid_modules.union(forbid_modules),
             restrict_modules=restrict_modules,
             pass_local_scopes=self.pass_local_scopes or pass_local_scopes,
+            preserve_values=self.preserve_values and preserve_values,
         )
 
 
@@ -372,6 +381,11 @@ def _maxray_walker_handler(x, ctx: NodeContext):
     # 2. run the active hooks
     global_write_active_token = _GLOBAL_WRITER_ACTIVE_FLAG.set(True)
     try:
+        ray = RayContext(
+            x, ctx, unpack_assignments=not _MAXRAY_TRANSFORM_SETTINGS.preserve_values
+        )
+        x = ray.value()
+
         for walk_hook in _MAXRAY_REGISTERED_HOOKS:
             # Our recompiled fn sets and unsets a contextvar whenever it is active
             if not walk_hook.active_call_state.get():
@@ -380,9 +394,9 @@ def _maxray_walker_handler(x, ctx: NodeContext):
             # Set the writer active flag
             write_active_token = walk_hook.writer_active_call_state.set(True)
             if walk_hook.mutable:
-                x = walk_hook.impl_fn(x, ctx)
+                x = walk_hook.impl_fn(x, ray)
             else:
-                walk_hook.impl_fn(x, ctx)
+                walk_hook.impl_fn(x, ray)
             walk_hook.writer_active_call_state.reset(write_active_token)
     finally:
         _GLOBAL_WRITER_ACTIVE_FLAG.reset(global_write_active_token)
@@ -394,14 +408,15 @@ T = TypeVar("T", bound=Callable)
 
 
 def maxray(
-    writer: Callable[[Any, NodeContext], Any],
+    writer: Callable[[Any, RayContext], Any],
     *,
     mutable=True,
     forbid_modules=frozenset(),
     restrict_modules=None,
-    pass_scope=False,
     initial_scope={},
     assume_transformed=False,
+    pass_scope=False,
+    preserve_values=True,
 ) -> Callable[[T], T]:
     """
     A transform that recursively hooks into all further calls made within the function, so that `writer` will (in theory) observe every single expression evaluated by the Python interpreter occurring as part of the decorated function call.
@@ -419,6 +434,7 @@ def maxray(
         forbid_modules=forbid_modules,
         restrict_modules=restrict_modules,
         pass_local_scopes=pass_scope,
+        preserve_values=preserve_values,
     )
 
     # TODO: allow configuring injection of variables into exec scope

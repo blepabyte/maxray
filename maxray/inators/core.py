@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from maxray.transforms import NodeContext
+from maxray.nodes import NodeContext, RayContext
 from .display import Display
 
 import ipdb
 import attrs
 
 import json
-from result import Result, Ok, Err
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +31,11 @@ class Statefool:
         return self._existing_keys[key][1]
 
     def __setitem__(self, key, value):
-        v, _old_value = self._existing_keys[key]
+        if key in self._existing_keys:
+            v, _old_value = self._existing_keys[key]
+        else:
+            v = 1
+
         self._existing_keys[key] = (v, value)
 
     def define_once(self, key, factory, /, v: int = 0):
@@ -243,29 +246,6 @@ class Rewriter:
         return self.by_class[rewrite_cls_name]
 
 
-def unpack_assign_context(x, ctx):
-    match ctx.props:
-        case {"assigned": {"targets": targets}}:
-            if len(targets) > 1:
-                if inspect.isgenerator(x) or isinstance(x, (map, filter)):
-                    # Greedily consume iterators before assignment
-                    unpacked_x = tuple(iter(x))
-                else:
-                    # Otherwise for chained equality like a = b, c = it, code may rely on `a` being of the original type
-                    unpacked_x = x
-
-                # TODO: doesn't work for starred assignments: x, *y, z = iterable
-                assigned = {target: val for target, val in zip(targets, unpacked_x)}
-                return unpacked_x, assigned
-
-            elif len(targets) == 1:
-                return x, {targets[0]: x}
-            else:
-                return x, {}
-        case _:
-            return x, {}
-
-
 class LoggingEncoder(json.JSONEncoder):
     def default(self, o):
         if attrs.has(type(o)):
@@ -273,40 +253,14 @@ class LoggingEncoder(json.JSONEncoder):
         return super().default(o)
 
 
-class Ray:
+class Ray(RayContext):
     """
     Captures the state of a point (syntax node) in the source code of the original program.
 
     One instance is created for each point in the program, that is then passed to multiple handlers.
     """
 
-    INSTANCE = ContextVar("RY")
-
-    def __init__(self, x, ctx: NodeContext, *, unpack_assignments: bool):
-        if unpack_assignments:
-            self._x, self._assigned = unpack_assign_context(x, ctx)
-        self.ctx = ctx
-
-    # TODO: staticmethod to get
-
-    @contextmanager
-    def _bind(self, x, ctx):
-        # TODO: assert no previous active instance
-        reset = Ray.INSTANCE.set(self)
-        try:
-            yield Ray.INSTANCE.get()
-        finally:
-            Ray.INSTANCE.reset(reset)
-
-    @staticmethod
-    def try_get() -> Result[Ray, None]:
-        try:
-            return Ok(Ray.INSTANCE.get())
-        except LookupError:
-            return Err(None)
-
-    @staticmethod
-    def log(msg, *, level="INFO"):
+    def log(self, msg, *, level="INFO"):
         """
         Logs to Rerun with the current context if active.
         """
@@ -319,52 +273,9 @@ class Ray:
             case _ if attrs.has(type(msg)):
                 msg = str(msg)
 
-        match Ray.try_get():
-            case Ok(ray):
-                location = Path(ray.ctx.fn_context.source_file).name
-                line = ray.ctx.location[0]
-                rr.log(f"log/{location}:{line}", rr.TextLog(msg, level=level))
-            case Err():
-                rr.log("log/somewhere", rr.TextLog(msg, level=level))
-
-    def value(self):
-        return self._x
-
-    def locals(self):
-        match self.ctx.local_scope:
-            case dict():
-                return self.ctx.local_scope
-            case None:
-                return {}
-            case _:
-                raise TypeError(
-                    f"Unexpected type {type(self.ctx.local_scope)} for local scope"
-                )
-
-    def assigned(self):
-        return self._assigned
-
-    def iterated(self):
-        match self.ctx.props:
-            case {"iterated": {"target": target}}:
-                return [target]
-            case _:
-                return []
-
-    def returned(self): ...
-
-    def entered(self):
-        """
-        Returns:
-            {
-                source: Source code of the LHS being entered
-                as_var: Variable binding after "as", if present
-        """
-        match self.ctx.props:
-            case {"entered": entered}:
-                return entered
-            case _:
-                return {}
+        location = Path(self.ctx.fn_context.source_file).name
+        line = self.ctx.location[0]
+        rr.log(f"log/{location}:{line}", rr.TextLog(msg, level=level))
 
     def contextmanager(self, fn: Callable[[Ray], Iterator[Any]]):
         return contextmanager(partial(fn, self))

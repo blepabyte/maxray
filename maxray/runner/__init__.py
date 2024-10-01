@@ -1,7 +1,7 @@
-from .exec_sources import ExecSource, DynamicSymbol
-from maxray import maxray, NodeContext
+from .exec_sources import DynamicSymbol
+from maxray import maxray
 from maxray.capture.logs import CaptureLogs
-from maxray.transforms import FnContext
+from maxray.nodes import NodeContext, FnContext, RayContext
 from maxray.function_store import FunctionStore
 from maxray.inators.core import Ray
 
@@ -307,11 +307,12 @@ class ScriptRunner:
 
     run_type: ScriptFromFile | ScriptFromString | ScriptFromModule
     enable_capture: bool = True
-    with_decor_inator: Callable = lambda x, ctx: x
+    with_decor_inator: Callable = lambda x, ray: x
     restrict_to_source_module: bool = False
     temp_sourcefile: Any = field(
         default_factory=lambda: tempfile.NamedTemporaryFile("w", delete=False)
     )
+    preserve_values: bool = False
 
     @staticmethod
     def run_script(script_path, **kwargs):
@@ -383,6 +384,7 @@ class ScriptRunner:
                     else None
                 ),
                 initial_scope=push_main_scope,
+                preserve_values=self.preserve_values,
             )(self.compile_to_callable())
         except KeyboardInterrupt as e:
             return RunAborted("Signal interrupt", e)
@@ -429,20 +431,23 @@ class ScriptRunner:
         """
         self.with_decor_inator(
             status,
-            NodeContext(
-                "maxray/runner",
-                f"{type(status).__name__}(...)",
-                FnContext(
-                    type(status).__init__,
-                    "__init__",
-                    "maxray.runner",
-                    "",
-                    "",
-                    0,
-                    call_count=ContextVar("maxray_call_counter", default=0),
-                    compile_id="00000000-0000-0000-0000-000000000000",
+            RayContext(
+                status,
+                NodeContext(
+                    "maxray/runner",
+                    f"{type(status).__name__}(...)",
+                    FnContext(
+                        type(status).__init__,
+                        "__init__",
+                        "maxray.runner",
+                        "",
+                        "",
+                        0,
+                        call_count=ContextVar("maxray_call_counter", default=0),
+                        compile_id="00000000-0000-0000-0000-000000000000",
+                    ),
+                    (0, 0, 0, 0),
                 ),
-                (0, 0, 0, 0),
             ),
         )
         return status
@@ -461,7 +466,8 @@ class ScriptRunner:
         )
         return functions_table
 
-    def rewrite_node(self, x, ctx: NodeContext):
+    def rewrite_node(self, x, ray: RayContext):
+        ctx = ray.ctx
         if ctx.fn_context.source_file == self.temp_sourcefile.name:
             # copy if needed to prevent mutation
 
@@ -483,7 +489,8 @@ class ScriptRunner:
         if self.enable_capture:
             CaptureLogs.extractor(x, ctx)
 
-        x = self.with_decor_inator(x, ctx)
+        ray.ctx = ctx
+        x = self.with_decor_inator(x, ray)
 
         return x
 
@@ -499,7 +506,6 @@ class InteractiveRunner:
         watch_hooks: list[WatchHook],
         *,
         loop: bool,
-        unpack_assignments: bool,
     ):
         self.runner = runner
         self.runner.with_decor_inator = self.apply_interactive_inators
@@ -507,7 +513,6 @@ class InteractiveRunner:
 
         self.watch_hooks = watch_hooks
         self.loop = loop
-        self.unpack_assignments = unpack_assignments
 
     def default_runner(self):
         while True:
@@ -601,10 +606,10 @@ class InteractiveRunner:
             for hook in self.watch_hooks:
                 hook.check_and_update(changed_files)
 
-    def apply_interactive_inators(self, x, ctx):
-        ray = Ray(x, ctx, unpack_assignments=self.unpack_assignments)
-        with ray._bind(x, ctx):
-            x = ray.value()
-            for hook in self.watch_hooks:
-                x = hook.call_latest(x, ray)
+    def apply_interactive_inators(self, x, ray: Ray):
+        ray.__class__ = Ray
+
+        for hook in self.watch_hooks:
+            x = hook.call_latest(x, ray)
+
         return x

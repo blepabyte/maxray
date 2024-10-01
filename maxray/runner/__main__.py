@@ -92,13 +92,12 @@ def cli(
         run,
         enable_capture=(capture is not None) or capture_default,
         restrict_to_source_module=restrict,
+        preserve_values=preserve,
     )
 
     as_interactive = len(hooks) > 0 or loop
     if as_interactive:
-        run_wrapper = InteractiveRunner(
-            run_wrapper, hooks, loop=loop, unpack_assignments=not preserve
-        )
+        run_wrapper = InteractiveRunner(run_wrapper, hooks, loop=loop)
 
     run_result = run_wrapper.run()
 

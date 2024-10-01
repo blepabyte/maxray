@@ -1,11 +1,14 @@
 from maxray import xray, maxray
 from maxray.transforms import NodeContext
-from maxray.walkers import dbg
 
 import importlib.util
 import tempfile
 
 import pytest
+
+
+def dbg(x, ray):
+    return x
 
 
 def if_package(pkg):

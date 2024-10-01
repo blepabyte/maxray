@@ -24,8 +24,7 @@ class CaptureLogs:
         "loc_col_start": pa.int32(),
         "loc_col_end": pa.int32(),
         # Function calls
-        "context_call_id": pa.string(),
-        "target_call_id": pa.string(),
+        "fn_compile_id": pa.string(),
         "fn": pa.string(),
         "fn_call_count": pa.int32(),
         # Source info/code
@@ -58,16 +57,13 @@ class CaptureLogs:
     @staticmethod
     def extractor(x, ctx: NodeContext):
         if isinstance(instance := CaptureLogs.instance.get(None), CaptureLogs):
-            if ctx.caller_id is not None:
-                instance.fn_sources[ctx.caller_id] = ctx.fn_context
             if ctx.source != "self":
                 instance.builder("loc_line_start").append(ctx.location[0])
                 instance.builder("loc_line_end").append(ctx.location[1])
                 instance.builder("loc_col_start").append(ctx.location[2])
                 instance.builder("loc_col_end").append(ctx.location[3])
 
-                instance.builder("context_call_id").append(ctx.fn_context.compile_id)
-                instance.builder("target_call_id").append(ctx.caller_id)
+                instance.builder("fn_compile_id").append(ctx.fn_context.compile_id)
                 instance.builder("source_file").append(ctx.fn_context.source_file)
                 instance.builder("source_module").append(ctx.fn_context.module)
                 instance.builder("source").append(ctx.source)
@@ -106,9 +102,6 @@ class CaptureLogs:
         )
 
     def __init__(self, stream_to_arrow_file=None, flush_every_records: int = 10_000):
-        # Maps function UUIDs (_MAXRAY_TRANSFORM_ID) to FnContext instances
-        self.fn_sources = {}
-
         self.builders = {}
 
         if stream_to_arrow_file is not None:

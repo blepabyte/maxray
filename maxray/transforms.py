@@ -1,3 +1,4 @@
+from .nodes import NodeContext, FnContext
 from .function_store import (
     FunctionData,
     prepare_function_for_transform,
@@ -10,7 +11,6 @@ import inspect
 import sys
 import builtins
 
-from dataclasses import dataclass, field
 from copy import deepcopy
 from result import Result, Ok, Err
 from contextvars import ContextVar
@@ -19,98 +19,6 @@ from functools import wraps
 from typing import Any, Callable, Optional
 
 from loguru import logger
-
-
-@dataclass
-class FnContext:
-    impl_fn: Callable
-    name: str  # qualname
-    module: str
-    source: str
-    source_file: str
-    line_offset: int
-    "Line number in `source_file` at which the function definition begins."
-
-    call_count: ContextVar[int]
-    compile_id: str
-
-    def __repr__(self):
-        # Call count not included in repr so the same source location can be "grouped by" over multiple calls
-        return f"{self.module}/{self.name}"
-
-
-@dataclass
-class NodeContext:
-    id: str
-    """
-    Identifier for the type of syntax node this event came from (`name/x`, `call/foo`, ...)
-    """
-
-    source: str
-
-    fn_context: FnContext
-    """
-    Resolved info of the function within which the source code of this node was transformed/compiled.
-    
-    Notes:
-        Not necessarily the actual active/called function (w.r.t. call stack) in the case of nested function defs (transformed as a whole).
-    """
-
-    location: tuple[int, int, int, int]
-    """
-    (start_line, end_line, start_col, end_col) as 0-indexed location of `source` in `fn_context.source_file`
-
-    Notes:
-        end_col is the exclusive endpoint of the range
-    """
-
-    local_scope: Optional[dict] = None
-    "When `pass_scope` is True, contains the output of `builtins.locals()` evaluated in the scope of the source expression"
-
-    caller_id: Any = None
-
-    props: dict = field(default_factory=lambda: {})
-
-    def __repr__(self):
-        return f"{self.fn_context}/{self.id}"
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "source": self.source,
-            "location": self.location,
-            "caller_id": self.caller_id,
-            "fn_context": {
-                "name": self.fn_context.name,
-                "module": self.fn_context.module,
-                "source_file": self.fn_context.source_file,
-                "call_count": self.fn_context.call_count.get(),
-            },
-        }
-
-    def _set_assigned(self, targets: list[str]):
-        self.props["assigned"] = {"targets": targets}
-        return self
-
-    def _set_iterated(self, target: str):
-        self.props["iterated"] = {"target": target}
-        return self
-
-    def _set_returned(self, value_source: str):
-        self.props["returned"] = {"value_source": value_source}
-        return self
-
-    def _set_called(self, call_args, call_kwargs):
-        # TODO: extract args and kwargs for call matching
-        # TODO: bind and pass TRANSFORM_ID if found
-        self.props["called"] = {}
-        return self
-
-    def _set_entered(self, source, as_var):
-        self.props["entered"] = {"source": source}
-        if as_var is not None:
-            self.props["entered"]["as_var"] = as_var
-        return self
 
 
 class RewriteRuntimeHelper:
@@ -210,10 +118,16 @@ class RewriteTransformCall(ast.Call):
             keywords=[],
         )
 
-    def called(self, call_args, call_kwargs):
+    def called(self, call_args: list[str], call_kwargs: dict[str, str]):
         self.args[1] = ast.Call(
             ast.Attribute(self.args[1], "_set_called", ctx=ast.Load()),
-            args=[ast.Constant(None), ast.Constant(None)],
+            args=[
+                ast.List([ast.Constant(a) for a in call_args], ctx=ast.Load()),
+                ast.Dict(
+                    keys=[ast.Constant(k) for k in call_kwargs.keys()],
+                    values=[ast.Constant(v) for v in call_kwargs.values()],
+                ),
+            ],
             keywords=[],
         )
 
@@ -548,33 +462,17 @@ class FnRewriter(ast.NodeTransformer):
                 )
                 ast.fix_missing_locations(node)
 
+        node_args = [self.recover_source(arg) for arg in node.args]
+        node_kwargs = {kw.arg: self.recover_source(kw.value) for kw in node.keywords}
+
         node = self.generic_visit(node)
 
         match node:
             case ast.Call(func=RewriteTransformCall() as rtc):
-                rtc.called(node.args, node.keywords)
-
-        # Want to keep track of which function we're calling
-        # Can't do ops on `node_pre.func` beacuse evaluating it has side effects
-        # `node.func` is likely a call to `_maxray_walker_handler`
-        node.func, node_func_ref = self.temp_binding(node.func)
-
-        extra_kwargs = []
-        if "super" not in source_pre:
-            extra_kwargs.append(
-                ast.keyword(
-                    "caller_id",
-                    value=ast.Call(
-                        func=ast.Name("getattr", ctx=ast.Load()),
-                        args=[
-                            node_func_ref,
-                            ast.Constant("_MAXRAY_TRANSFORM_ID"),
-                            ast.Constant(None),
-                        ],
-                        keywords=[],
-                    ),
+                rtc.called(
+                    node_args,
+                    node_kwargs,
                 )
-            )
 
         # the function/callable instance itself is observed by Name/Attribute/... nodes
         return ast.copy_location(
@@ -582,7 +480,6 @@ class FnRewriter(ast.NodeTransformer):
                 node,
                 f"call/{source_pre}",
                 node_source=source_pre,
-                extra_kwargs=extra_kwargs,
             ),
             node_pre,
         )
