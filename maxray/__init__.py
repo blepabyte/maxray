@@ -12,27 +12,12 @@ from result import Result, Ok, Err
 
 import os
 
-from loguru import logger
+from loguru import logger as _logger
+from .logging import logger
 
 if not os.environ.get("MAXRAY_LOG_LEVEL"):
     # Avoid logspam for users of the library
-    logger.disable("maxray")
-
-
-def _set_logging(enabled: bool):
-    if enabled:
-        logger.enable("maxray")
-    else:
-        logger.disable("maxray")
-
-
-@contextmanager
-def _with_logging():
-    try:
-        _set_logging(True)
-        yield
-    finally:
-        _set_logging(False)
+    _logger.disable("maxray")
 
 
 def transform(writer):

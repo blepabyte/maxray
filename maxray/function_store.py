@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from loguru import logger
+from .logging import logger
 
 
 method_wrapper = type(object().__init__)

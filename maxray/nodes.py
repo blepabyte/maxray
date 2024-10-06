@@ -8,7 +8,7 @@ from pathlib import Path
 
 from typing import Any, Callable, Optional
 
-from loguru import logger
+from .logging import logger
 
 
 @dataclass
@@ -21,7 +21,6 @@ class FnContext:
     line_offset: int
     "Line number in `source_file` at which the function definition begins."
 
-    call_count: ContextVar[int]
     compile_id: str
 
     def __repr__(self):
