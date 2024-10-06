@@ -18,7 +18,7 @@ from functools import wraps
 
 from typing import Any, Callable, Optional
 
-from loguru import logger
+from .logging import logger
 
 
 class RewriteRuntimeHelper:
@@ -148,7 +148,6 @@ class FnRewriter(ast.NodeTransformer):
         *,
         instance_type: str | None,
         dedent_chars: int = 0,
-        record_call_counts: bool = True,
         pass_locals_to_ctx: bool = False,
         is_maxray_root: bool = False,
     ):
@@ -161,7 +160,6 @@ class FnRewriter(ast.NodeTransformer):
         self.runtime_helper = runtime_helper
         self.instance_type = instance_type
         self.dedent_chars = dedent_chars
-        self.record_call_counts = record_call_counts
         self.pass_locals_to_ctx = pass_locals_to_ctx
         self.is_maxray_root = is_maxray_root
 
@@ -540,16 +538,10 @@ class FnRewriter(ast.NodeTransformer):
 
         out = ast.copy_location(out, pre_node)
 
-        # Add statements after visiting so that walk handlers aren't called on this internal code
-        if self.fn_count == 1 and self.record_call_counts:
-            # has to be applied as a decorator so that inner recursive calls of the fn are tracked properly
-            out.decorator_list.append(
-                ast.Call(
-                    func=ast.Name(id="_MAXRAY_DECORATE_WITH_COUNTER", ctx=ast.Load()),
-                    args=[ast.Name(id="_MAXRAY_CALL_COUNTER", ctx=ast.Load())],
-                    keywords=[],
-                )
-            )
+        # Apply decorators here? needed for inner recursive calls of the fn to be tracked properly (vs just post-applying a wrapper to the transformed function)
+        # if self.fn_count == 1 and self.record_call_counts:
+        #     # has to be applied as a decorator so that
+        #     out.decorator_list.append(...)
 
         self.known_globals_stack.pop()
         return out
@@ -681,7 +673,6 @@ def recompile_fn_with_transform(
     use_relative_import_root = module.__name__.split(".")[0]
     use_relative_import_root = getattr(module, "__package__", use_relative_import_root)
 
-    fn_call_counter = ContextVar("maxray_call_counter", default=0)
     fn_context = FnContext(
         source_fn,
         source_fn.__qualname__,
@@ -689,7 +680,6 @@ def recompile_fn_with_transform(
         with_source_fn.source,
         with_source_fn.source_file,
         with_source_fn.source_offset_lines,
-        fn_call_counter,
         compile_id=with_source_fn.compile_id,
     )
     runtime_helper = RewriteRuntimeHelper(fn_context)
@@ -722,8 +712,6 @@ def recompile_fn_with_transform(
             transform_fn.__name__: transform_fn,
             NodeContext.__name__: NodeContext,
             "_MAXRAY_FN_CONTEXT": fn_context,
-            "_MAXRAY_CALL_COUNTER": fn_call_counter,
-            "_MAXRAY_DECORATE_WITH_COUNTER": count_calls_with,
             "_MAXRAY_MODULE_GLOBALS": vars(module),
             **runtime_helper.expand_scope(),
         },
@@ -846,40 +834,6 @@ def recompile_fn_with_transform(
     #     )
 
     return Ok(transformed_fn)
-
-
-# TODO: probably better to modify the generated code directly instead of relying on a wrapper...
-def count_calls_with(counter: ContextVar):
-    def inner(fn):
-        # TODO: synchronisation/context?
-        total_calls_count = 0
-
-        if inspect.iscoroutinefunction(fn):
-
-            @wraps(fn)
-            async def fn_with_counter(*args, **kwargs):
-                nonlocal total_calls_count
-                total_calls_count += 1
-                reset_call = counter.set(total_calls_count)
-                try:
-                    return await fn(*args, **kwargs)
-                finally:
-                    counter.reset(reset_call)
-        else:
-
-            @wraps(fn)
-            def fn_with_counter(*args, **kwargs):
-                nonlocal total_calls_count
-                total_calls_count += 1
-                reset_call = counter.set(total_calls_count)
-                try:
-                    return fn(*args, **kwargs)
-                finally:
-                    counter.reset(reset_call)
-
-        return fn_with_counter
-
-    return inner
 
 
 FILE_TO_SYS_MODULES = {}

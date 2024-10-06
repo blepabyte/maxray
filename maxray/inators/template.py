@@ -1,7 +1,12 @@
-from maxray.inators.core import S, Ray
+"""
+A composable layer that can be applied on top of the execution of any Python script or module.
+"""
+
+from maxray.inators.core import R, S, NodeContext, Ray
 from maxray.inators.base import BaseInator
 from maxray.runner import (
     MAIN_FN_NAME,
+    ExecInfo,
     RunAborted,
     RunCompleted,
     RunErrored,
@@ -10,30 +15,39 @@ from maxray.runner import (
     Break,
 )
 
-from uuid import uuid4
 from contextlib import contextmanager
 
+import click
 import rerun as rr
 
 
 class Inator(BaseInator):
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    @click.command()
+    def cli():
+        return Inator()
+
     def xray(self, x, ray: Ray):
-        S.define_once(
-            "RERUN_INSTANCE",
-            lambda _: rr.init(f"{self}", spawn=True, recording_id=str(uuid4())),
-            v=1,
-        )
+        """
+        (x)ray: a callback for each evaluated expression corresponding to an AST node in the original source code.
+
+        Args:
+            `x`: the "current" value, evaluated sequentially before/after other `BaseInator`s that have been applied.
+            `ray`: provides access to the evaluation context; local variables, source code, and utility functions to match on function calls, variable assignments, `with` entries, etc.
+        """
+        ctx: NodeContext = ray.ctx
 
     def maxray(self, x, ray: Ray):
-        ctx = ray.ctx
+        """
+        (m)utable xray: this function must return a value to replace `x` in the evaluation of the source expression.
 
-        # Manual control flow
-        # exit()
-        # raise Break()
-        # raise AbortRun()
-        # raise RestartRun()
+        Coarse control flow can be achieved via `exit()` or raising one of `Break()`, `AbortRun()`, or `RestartRun()`.
+        """
+        ctx: NodeContext = ray.ctx
 
-        # Global source code overlays
         match ctx.source:
             case "...":
                 ...
@@ -48,18 +62,30 @@ class Inator(BaseInator):
 
         match ray.assigned():
             case {"df": df}:
-                S.display(df)
+                ...
             case _:
                 ...
 
         return x
 
+    @contextmanager
+    def enter_session(self, xi: ExecInfo):
+        try:
+            with super().enter_session(xi):
+                yield
+        finally:
+            ...
+
     def runner(self):
-        # WARNING: Changes to this function are NOT applied on reload
-        # You should modify `match_run_result` below instead
+        """
+        Generator interface that lets you run the original program arbitrarily many times, handling error cases and cleanup logic.
+        Each iteration yields another run of the program.
+
+        Note:
+            Changes to this function are NOT applied on reload -- modify `match_run_result` below instead
+        """
         try:
             while True:
-                # Each iteration yields another run of the program
                 result: RunCompleted | RunAborted | RunErrored = yield
                 match result:
                     case RunAborted(exception=RestartRun()):
@@ -67,12 +93,11 @@ class Inator(BaseInator):
                     case RunAborted(exception=AbortRun()):
                         ...
                     case RunAborted():
-                        return  # Unhandleable error
+                        return
 
                 self.match_run_result(result)
 
         finally:
-            # Cleanup logic either here or in self.enter_session (contextmanager)
             ...
 
     def match_run_result(self, result: RunCompleted | RunAborted | RunErrored):

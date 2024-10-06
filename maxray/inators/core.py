@@ -4,19 +4,16 @@ from maxray.nodes import NodeContext, RayContext
 from .display import Display
 
 import ipdb
-import attrs
 
-import json
 from contextvars import ContextVar
 from dataclasses import dataclass
-from pathlib import Path
 import inspect
 from functools import partial
 from contextlib import contextmanager
 from types import TracebackType
 from typing import Any, Callable, Generator, Iterator
 
-import rerun as rr
+from loguru import logger
 
 
 class Statefool:
@@ -246,13 +243,6 @@ class Rewriter:
         return self.by_class[rewrite_cls_name]
 
 
-class LoggingEncoder(json.JSONEncoder):
-    def default(self, o):
-        if attrs.has(type(o)):
-            return attrs.asdict(o)
-        return super().default(o)
-
-
 class Ray(RayContext):
     """
     Captures the state of a point (syntax node) in the source code of the original program.
@@ -260,22 +250,12 @@ class Ray(RayContext):
     One instance is created for each point in the program, that is then passed to multiple handlers.
     """
 
-    def log(self, msg, *, level="INFO"):
-        """
-        Logs to Rerun with the current context if active.
-        """
-        match msg:
-            case dict():
-                try:
-                    msg = json.dumps(msg, indent=2, cls=LoggingEncoder)
-                except Exception:
-                    msg = str(msg)
-            case _ if attrs.has(type(msg)):
-                msg = str(msg)
-
-        location = Path(self.ctx.fn_context.source_file).name
-        line = self.ctx.location[0]
-        rr.log(f"log/{location}:{line}", rr.TextLog(msg, level=level))
+    def log(self, msg: str, *, level="INFO"):
+        logger.bind(
+            maxray_logged_from="ray",
+            source_file=self.ctx.fn_context.source_file,
+            source_line=self.ctx.location[0],
+        ).log(level, str(msg))
 
     def contextmanager(self, fn: Callable[[Ray], Iterator[Any]]):
         return contextmanager(partial(fn, self))

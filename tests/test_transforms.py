@@ -482,45 +482,6 @@ def test_junk_annotations():
     assert outer() == "2100"
 
 
-def test_call_counts():
-    calls = []
-
-    def track_call_counts(x, ray: RayContext):
-        calls.append(ray.ctx.fn_context.call_count.get())
-        return x
-
-    @xray(track_call_counts)
-    def f(x):
-        return x
-
-    f(1)
-    f(1)
-    assert set(calls) == {1, 2}
-
-    f(1)
-    assert set(calls) == {1, 2, 3}
-
-
-def test_call_counts_recursive():
-    calls = []
-
-    def track_call_counts(x, ray: RayContext):
-        ctx = ray.ctx
-        if ctx.id in ["name/f", "call/f(x - 1)"]:
-            calls.append(ctx.fn_context.call_count.get())
-        return x
-
-    @xray(track_call_counts)
-    @xray(dbg)
-    def f(x):
-        if x > 0:
-            return f(x - 1)
-        return 1
-
-    f(3)
-    assert calls == [1, 2, 3, 3, 2, 1]
-
-
 def test_empty_return():
     @xray(dbg)
     def empty_returns():

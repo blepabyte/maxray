@@ -1,6 +1,9 @@
-from .exec_sources import DynamicSymbol
+from .exec_sources import (
+    ReloadableFunction,
+    ReloadableInstance,
+    reloadable_from_spec,
+)
 from maxray import maxray
-from maxray.capture.logs import CaptureLogs
 from maxray.nodes import NodeContext, FnContext, RayContext
 from maxray.function_store import FunctionStore
 from maxray.inators.core import Ray
@@ -94,102 +97,42 @@ def watch_files(file_paths):
 
 
 @dataclass
-class WatchHook:
-    watched: DynamicSymbol
-    last_inator: Callable = lambda x, ray: x
+class ReloadHook:
+    watched: ReloadableFunction | ReloadableInstance
     needs_reload: threading.Event = field(default_factory=set_event)
 
-    def block_call_until_updated(self, x, ray: Ray):
+    def wait_for_update(self):
         self.needs_reload.clear()
         self.needs_reload.wait()
-        return self.call_latest(x, ray)
 
-    def require_reload(self):
-        self.needs_reload.set()
+    def reload(self):
+        while self.watched.reload().is_err():
+            # TODO: some indicator that we're waiting?
+            self.wait_for_update()
 
-    def call_latest(self, x, ray: Ray):
-        # Lazily import only when actually called
-        if self.needs_reload.is_set():
-            self.last_inator = self.watched.load()
-            self.needs_reload.clear()
-        return self.last_inator(x, ray)
+        if isinstance(self.watched, ReloadableInstance):  # patch
+            self.watched.instance.wait_and_reload = self.wait_and_reload
 
-    def check_and_update(self, changed_files):
-        if not self.needs_reload.is_set() and self.watched.is_changed_by_files(
-            changed_files
-        ):
-            self.needs_reload.set()
-
-    @staticmethod
-    def build(watch_spec: str):
-        """
-        Watch spec of `foo.py:some_fn` means `some_fn` will be imported from `foo.py`, and reloaded every time that file is changed
-        """
-        return WatchHook(DynamicSymbol.from_spec(watch_spec, "maxray.inators").unwrap())
-
-
-@dataclass
-class InstanceWatchHook:
-    watched: DynamicSymbol
-    state_instance: Optional[Callable] = None  # Lazily import only when actually called
-    needs_reload: threading.Event = field(default_factory=set_event)
-
-    def block_call_until_updated(self, x, ray: Ray):
         self.needs_reload.clear()
-        self.needs_reload.wait()
-        return self.call_latest(x, ray)
-
-    def require_reload(self):
-        self.needs_reload.set()
 
     def wait_and_reload(self):
-        self.needs_reload.clear()
-        self.needs_reload.wait()
-        self.fetch_latest()
+        self.wait_for_update()
+        self.reload()
 
-    def fetch_latest(self):
-        if self.state_instance is not None and not self.needs_reload.is_set():
-            return self.state_instance
-
-        # Can handle errors in reload if the instance has been loaded successfully at least once
-        if self.state_instance is not None:
-            while True:
-                with self.state_instance._handle_reload():
-                    state_type = self.watched.load()
-                    break
-                self.needs_reload.clear()
-                self.needs_reload.wait()
-        else:
-            # No error handling
-            state_type = self.watched.load()
-
-        if self.state_instance is None:
-            self.state_instance = state_type()
-        else:
-            # Monkey-patch to preserve state between hot reloads
-            self.state_instance.__class__ = state_type
-
-        self.state_instance.wait_and_reload = self.wait_and_reload
-        self.needs_reload.clear()
-        return self.state_instance
+    def require_reload(self):
+        self.needs_reload.set()
 
     def call_latest(self, x, ray: Ray):
-        return self.fetch_latest()(x, ray)
+        if self.needs_reload.is_set():
+            self.reload()
+
+        return self.watched.call(x, ray)
 
     def check_and_update(self, changed_files):
-        if not self.needs_reload.is_set() and self.watched.is_changed_by_files(
+        if not self.needs_reload.is_set() and self.watched.triggers_reload(
             changed_files
         ):
             self.needs_reload.set()
-
-    @staticmethod
-    def build(watch_spec: str):
-        """
-        Watch spec of `foo.py:some_fn` means `some_fn` will be imported from `foo.py`, and reloaded every time that file is changed
-        """
-        return InstanceWatchHook(
-            DynamicSymbol.from_spec(watch_spec, "maxray.inators").unwrap()
-        )
 
 
 class ScriptFromFile:
@@ -199,8 +142,8 @@ class ScriptFromFile:
     def source(self):
         return self.script_path.read_text()
 
-    def sourcemap_to(self):
-        return str(self.script_path)
+    def sourcemap_to(self) -> Path:
+        return self.script_path
 
     def extra_sys_path(self):
         return [str(self.script_path.parent)]
@@ -229,8 +172,8 @@ class ScriptFromModule:
     def source(self):
         return self.main_path.read_text()
 
-    def sourcemap_to(self):
-        return str(self.main_path)
+    def sourcemap_to(self) -> Path:
+        return self.main_path
 
     def extra_sys_path(self):
         return []
@@ -261,16 +204,18 @@ class ScriptFromString:
 
 
 @dataclass
+class ExecInfo:
+    source_origin: Optional[Path]
+    temp_exec_file: Path
+
+
+@dataclass
 class RunCompleted:
-    logs_arrow: Any
-    functions_arrow: Any
     final_scope: dict = field(default_factory=dict)
 
 
 @dataclass
 class RunErrored:
-    logs_arrow: Any
-    functions_arrow: Any
     exception: Exception
     traceback: TracebackType
 
@@ -305,8 +250,8 @@ class ScriptRunner:
     Supports programmatically running Python scripts and modules in a __main__ context with specified maxray transforms applied.
     """
 
+    # TODO: remove default args and document
     run_type: ScriptFromFile | ScriptFromString | ScriptFromModule
-    enable_capture: bool = True
     with_decor_inator: Callable = lambda x, ray: x
     restrict_to_source_module: bool = False
     temp_sourcefile: Any = field(
@@ -370,7 +315,7 @@ class ScriptRunner:
 
         push_main_scope = {
             "__name__": "__main__",
-            "__file__": self.run_type.sourcemap_to(),
+            "__file__": str(self.run_type.sourcemap_to()),
         }
 
         # Try to evaluate source (e.g. could fail with SyntaxError)
@@ -394,36 +339,31 @@ class ScriptRunner:
 
         # HACKY exception logic
         # click gives us no choice because it *insists* on stealing KeyboardInterrupt even in standalone mode and throwing SystemExit
-        with CaptureLogs() as cl:
-            try:
-                final_scope = fn()
+        try:
+            final_scope = fn()
 
-            except Exception as e:
-                return self.run_end_hook(
-                    RunErrored(
-                        cl.collect(),
-                        self.collect_functions(),
-                        e,
-                        e.__traceback__,
-                    )
+        except Exception as e:
+            return self.run_end_hook(
+                RunErrored(
+                    e,
+                    e.__traceback__,
                 )
+            )
 
-            except (AbortRun, RestartRun) as e:
-                # this is the only way to quit the run as `exit` will not work
-                return RunAborted("User abort", e)
+        except (AbortRun, RestartRun) as e:
+            # this is the only way to quit the run as `exit` will not work
+            return RunAborted("User abort", e)
 
-            except KeyboardInterrupt as e:
-                return RunAborted("Signal interrupt", e)
+        except KeyboardInterrupt as e:
+            return RunAborted("Signal interrupt", e)
 
-            except SystemExit as e:
-                return RunAborted("Forced exit", e)
+        except SystemExit as e:
+            return RunAborted("Forced exit", e)
 
-            except BaseException as e:
-                return RunAborted("BaseException with unknown intent", e)
+        except BaseException as e:
+            return RunAborted("BaseException with unknown intent", e)
 
-        return self.run_end_hook(
-            RunCompleted(cl.collect(), self.collect_functions(), final_scope)
-        )
+        return self.run_end_hook(RunCompleted(final_scope))
 
     def run_end_hook(self, status: RunCompleted | RunErrored):
         """
@@ -443,7 +383,6 @@ class ScriptRunner:
                         "",
                         "",
                         0,
-                        call_count=ContextVar("maxray_call_counter", default=0),
                         compile_id="00000000-0000-0000-0000-000000000000",
                     ),
                     (0, 0, 0, 0),
@@ -451,20 +390,6 @@ class ScriptRunner:
             ),
         )
         return status
-
-    def collect_functions(self):
-        functions_table = FunctionStore.collect()
-        # Patch the correct source file names (temporary -> actual)
-        sf_col_idx = functions_table.column_names.index("source_file")
-        remapped_source_file = pc.replace_substring_regex(
-            functions_table["source_file"],
-            pattern=rf"^{self.temp_sourcefile.name}$",
-            replacement=f"{self.run_type.sourcemap_to()}",
-        )
-        functions_table = functions_table.set_column(
-            sf_col_idx, functions_table.field(sf_col_idx), remapped_source_file
-        )
-        return functions_table
 
     def rewrite_node(self, x, ray: RayContext):
         ctx = ray.ctx
@@ -476,7 +401,7 @@ class ScriptRunner:
                 ctx.fn_context
             )  # functions and contextvars can't be deepcopied
 
-            ctx.fn_context.source_file = self.run_type.sourcemap_to()
+            ctx.fn_context.source_file = str(self.run_type.sourcemap_to())
 
             # subtract the "def" line and new indentation
             ctx.location = (
@@ -485,9 +410,6 @@ class ScriptRunner:
                 ctx.location[2] - 4,
                 ctx.location[3] - 4,
             )
-
-        if self.enable_capture:
-            CaptureLogs.extractor(x, ctx)
 
         ray.ctx = ctx
         x = self.with_decor_inator(x, ray)
@@ -503,7 +425,7 @@ class InteractiveRunner:
     def __init__(
         self,
         runner: ScriptRunner,
-        watch_hooks: list[WatchHook],
+        watch_hooks: list[ReloadHook],
         *,
         loop: bool,
     ):
@@ -535,6 +457,9 @@ class InteractiveRunner:
             self.block_until_update()
 
     def run(self) -> RunCompleted | RunErrored | RunAborted:
+        exec_info = ExecInfo(
+            self.run_type.sourcemap_to(), Path(self.runner.temp_sourcefile.name)
+        )
         watcher = threading.Thread(target=self.watch_loop, daemon=True)
         # Well, we can't kill a thread so we'll just let it die on program exit...
         # BUG: pthreads stuff...
@@ -545,9 +470,9 @@ class InteractiveRunner:
         run_generators = []
         session_stack = ExitStack()
         for wh in self.watch_hooks:
-            if isinstance(wh, InstanceWatchHook):
-                inator = wh.fetch_latest()
-                session_stack.enter_context(inator.enter_session())
+            if isinstance(wh.watched, ReloadableInstance):
+                inator = wh.watched.instance
+                session_stack.enter_context(inator.enter_session(exec_info))
                 try:
                     run_generators.append(inator.runner())
                 except NotImplementedError:
@@ -582,10 +507,10 @@ class InteractiveRunner:
         """
         Wait until either the script file or one of the watched files is modified.
         """
-        # TODO: print a message here? multiple interact backends required?
+        # TODO: support watching dirs
         files_to_watch = list(
             itertools.chain.from_iterable(
-                hook.watched.files_to_watch() for hook in self.watch_hooks
+                hook.watched.depends_on_files for hook in self.watch_hooks
             )
         )
         if (source_file := self.run_type.sourcemap_to()) is not None:
@@ -595,10 +520,10 @@ class InteractiveRunner:
             return
 
     def watch_loop(self):
-        # Support multiple scripts, each of which can be hot-reloaded individually
+        # TODO: support watching dirs
         files = list(
             itertools.chain.from_iterable(
-                hook.watched.files_to_watch() for hook in self.watch_hooks
+                hook.watched.depends_on_files for hook in self.watch_hooks
             )
         )
 

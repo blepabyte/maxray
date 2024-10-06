@@ -23,6 +23,3 @@ def test_sample_script():
 def test_sample_module():
     results = ScriptRunner.run_module("maxray._test_module")
     assert isinstance(results, RunCompleted)
-    assert any(
-        "_test_module" in f for f in results.functions_arrow["source_file"].to_pylist()
-    )

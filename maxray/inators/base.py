@@ -1,25 +1,8 @@
-from maxray.transforms import NodeContext
+from maxray.nodes import NodeContext
 from maxray.inators.core import S, Ray
-from maxray.runner import RunCompleted, RunErrored, RunAborted, Break
+from maxray.runner import ExecInfo, RunCompleted, RunErrored, RunAborted, Break
 
-import ipdb
-import rich
-from rich.traceback import Traceback
-from rich.live import Live
-from rich.pretty import Pretty
-
-import io
-import sys
-import builtins
-from pathlib import Path
-from functools import partial
 from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
-
-from typing import Any, Optional
-
-import rerun as rr
 
 
 class BaseInator:
@@ -31,12 +14,9 @@ class BaseInator:
         self._name = type(self).__name__
 
     def __repr__(self):
-        return self._name
+        return f"{self._name}()"
 
     def __call__(self, x, ray: Ray):
-        if x is builtins.print:
-            x = partial(self.print, ctx=ray.ctx)
-
         S.display.update_context(ray.ctx)
 
         while True:
@@ -93,7 +73,7 @@ class BaseInator:
             S.display.render_traceback(e, e.__traceback__)
 
     @contextmanager
-    def enter_session(self):
+    def enter_session(self, xi: ExecInfo):
         try:
             yield
         finally:
@@ -110,23 +90,3 @@ class BaseInator:
             case RunErrored(exception=exception, traceback=traceback):
                 S.display.update_status("[red]Errored")
                 S.display.render_traceback(exception, traceback)
-
-    def print(self, *args, ctx, **kwargs):
-        if "file" in kwargs:
-            return print(*args, **kwargs)
-
-        print(*args, **kwargs, file=(buf := io.StringIO()))
-
-        source_location = (
-            Path(ctx.fn_context.source_file).name + ":" + str(ctx.location[0] + 1)
-        )
-        rr.log(
-            f"print/{source_location}",
-            rr.TextLog(buf.getvalue().strip(), level="TRACE"),
-        )
-
-    # Utility functions
-
-    def log(self, obj, level="INFO"):
-        rr.log("log", rr.TextLog(str(obj), level=level))
-        return obj

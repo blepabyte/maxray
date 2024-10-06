@@ -1,10 +1,10 @@
+from maxray.runner.exec_sources import reloadable_from_spec
 from . import (
     ScriptFromModule,
     ScriptFromFile,
     ScriptRunner,
     InteractiveRunner,
-    WatchHook,
-    InstanceWatchHook,
+    ReloadHook,
     RunCompleted,
     RunErrored,
     RunAborted,
@@ -13,28 +13,17 @@ import pyarrow.feather as ft
 
 import sys
 from pathlib import Path
-from typing import Optional
 
 import click
-
-
-_DEFAULT_CAPTURE_LOGS_NAME = ".maxray-logs.arrow"
 
 
 @click.command(
     context_settings=dict(ignore_unknown_options=True, allow_interspersed_args=True)
 )
 @click.argument("script", type=str)
-@click.option("-w", "--watch", type=str, multiple=True)
-@click.option("-W", "--watch-instance", type=str, multiple=True)
+@click.option("-W", "--watch", type=str, multiple=True)
+# TODO: -x, --exclude-module
 @click.option("-m", "--module", is_flag=True)
-@click.option(
-    "-c",
-    "--capture-default",
-    is_flag=True,
-    help=f"Save the recorded logs to the same folder as the script with the default name [{_DEFAULT_CAPTURE_LOGS_NAME}]",
-)
-@click.option("-C", "--capture", type=str, help="Save the recorded logs to this path")
 @click.option(
     "-l",
     "--loop",
@@ -52,17 +41,20 @@ _DEFAULT_CAPTURE_LOGS_NAME = ".maxray-logs.arrow"
     is_flag=True,
     help="Don't recursively patch source code, only tracing code in the immediately invoked script file",
 )
+@click.option(
+    "--rerun",
+    is_flag=True,
+    help="Start a rerun.io viewer (requires `rerun-sdk` to be installed)",
+)
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def cli(
     script: str,
     module: bool,
     watch: tuple,
-    watch_instance: tuple,
     loop: bool,
-    capture_default: bool,
-    capture: Optional[str],
     restrict: bool,
     preserve: bool,
+    rerun: bool,
     args,
 ):
     # Reset sys.argv so client scripts don't try to parse our arguments
@@ -70,27 +62,23 @@ def cli(
 
     if module:
         run = ScriptFromModule(script)
+        run_name = script
     else:
         run = ScriptFromFile(script)
+        run_name = Path(script).name
 
     hooks = []
     if watch:
-        hooks.extend(WatchHook.build(spec) for spec in watch)
-    if watch_instance:
-        for spec in watch_instance:
-            if spec == "-":
-                overlay_script = (
-                    (script_path := Path(script))
-                    .resolve(True)
-                    .with_name(f"over_{script_path.name}")
-                )
-                hooks.append(InstanceWatchHook.build(f"{overlay_script}:Inator"))
-            else:
-                hooks.append(InstanceWatchHook.build(spec))
+        for spec in watch:
+            hooks.append(ReloadHook(reloadable_from_spec(spec).unwrap()))
+
+        if hooks and rerun:
+            hooks.append(
+                ReloadHook(reloadable_from_spec("maxray.inators.rerun:Setup").unwrap())
+            )
 
     run_wrapper = ScriptRunner(
         run,
-        enable_capture=(capture is not None) or capture_default,
         restrict_to_source_module=restrict,
         preserve_values=preserve,
     )
@@ -98,6 +86,11 @@ def cli(
     as_interactive = len(hooks) > 0 or loop
     if as_interactive:
         run_wrapper = InteractiveRunner(run_wrapper, hooks, loop=loop)
+
+    if rerun:
+        import rerun as rr
+
+        rr.init(f"xpy:{run_name}", spawn=True)
 
     run_result = run_wrapper.run()
 
@@ -108,26 +101,6 @@ def cli(
             sys.exit(0)
         else:
             sys.exit(2)
-
-    if capture is not None:
-        capture_to = Path(capture)
-        ft.write_feather(run_result.logs_arrow, str(capture_to))
-        ft.write_feather(
-            run_result.functions_arrow,
-            str(capture_to.with_stem(capture_to.stem + "-functions")),
-        )
-    elif capture_default:
-        capture_to = (
-            Path(run.sourcemap_to()).resolve(True).parent / _DEFAULT_CAPTURE_LOGS_NAME
-        )
-        ft.write_feather(
-            run_result.logs_arrow,
-            str(capture_to),
-        )
-        ft.write_feather(
-            run_result.functions_arrow,
-            str(capture_to.with_stem(capture_to.stem + "-functions")),
-        )
 
     match run_result:
         case RunErrored():
