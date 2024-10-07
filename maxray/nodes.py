@@ -119,7 +119,7 @@ class RayContext:
         match ctx.props:
             case {"assigned": {"targets": targets}}:
                 if len(targets) > 1:
-                    if inspect.isgenerator(x) or isinstance(x, (map, filter)):
+                    if inspect.isgenerator(x) or isinstance(x, (map, filter, zip)):
                         # Greedily consume iterators before assignment
                         unpacked_x = tuple(iter(x))
                     else:
@@ -127,7 +127,12 @@ class RayContext:
                         unpacked_x = x
 
                     # TODO: doesn't work for starred assignments: x, *y, z = iterable
-                    assigned = {target: val for target, val in zip(targets, unpacked_x)}
+                    try:
+                        assigned = {
+                            target: val for target, val in zip(targets, unpacked_x)
+                        }
+                    except ValueError:  # not enough / too many values to unpack
+                        assigned = {}
                     return unpacked_x, assigned
 
                 elif len(targets) == 1:

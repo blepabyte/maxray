@@ -28,9 +28,10 @@ import click
 
 
 class CaptureCallgraph(BaseInator):
-    def __init__(self):
+    def __init__(self, all_calls=False):
         super().__init__()
         self.G = nx.DiGraph()
+        self.all_calls = all_calls
 
     def xray(self, x, ray: Ray):
         src_id = ray.ctx.fn_context.name
@@ -38,15 +39,24 @@ class CaptureCallgraph(BaseInator):
         # raise Break()
         # TODO: handle noncompiled and errored functions
 
+        # TODO: identify functions properly/qualname/modules
         match ray.called():
             case {"target": _} if isinstance(x, type):
                 # __init__
-                dst_id = f"{x.__name__}.__init__"
+                dst_id = f"{x.__name__}()"
                 self.G.add_edge(src_id, dst_id)
 
             case {"fn_compile_id": compile_id}:
                 dst_id = FunctionStore.get(compile_id).data.qualname
                 self.G.add_edge(src_id, dst_id)
+
+            case {"target": _} if self.all_calls:
+                try:
+                    dst_id = x.__getattribute__("__name__")
+                    self.G.add_edge(src_id, dst_id)
+
+                except Exception:
+                    pass
 
 
 class Draw(CaptureCallgraph):

@@ -369,8 +369,17 @@ class FnRewriter(ast.NodeTransformer):
         new_node = self.generic_visit(node)
         match new_node:
             case ast.Assign(targets=targets, value=RewriteTransformCall() as rtc):
-                target_reprs = [self.recover_source(t) for t in targets]
-                rtc.assigned(target_reprs)
+                # TODO: does not properly handle chained assignments like a = b, c = thing()
+                # note that it would be (almost always?) nonsensical for thing() to be any kind of stateful iterator
+                # because unpacking can nest arbitrarily, just gonna implement one level here for now
+                match targets:
+                    case [ast.Tuple(elts=elts) | ast.List(elts=elts)]:
+                        if not any(isinstance(el, ast.Starred) for el in elts):
+                            target_reprs = [self.recover_source(el) for el in elts]
+                            rtc.assigned(target_reprs)
+
+                    case [target]:
+                        rtc.assigned([self.recover_source(target)])
 
         return new_node
 
