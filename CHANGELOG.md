@@ -1,5 +1,43 @@
 # CHANGELOG
 
+## v0.7.0 (2024-10-07)
+
+### Documentation
+
+* docs: update README ([`7dcc70f`](https://github.com/blepabyte/maxray/commit/7dcc70fa21e637bdf8e321de1db07fa7a8a40331))
+
+### Feature
+
+* feat: draw runtime callgraph ([`9eb6619`](https://github.com/blepabyte/maxray/commit/9eb6619c8c7cfda54fdebde36c21102817fb47c4))
+
+* feat: capture and rerun inators ([`60bbb02`](https://github.com/blepabyte/maxray/commit/60bbb024108b5afc3285f0d3b75af21871f2fcc5))
+
+* feat: custom template builder ([`802ddb3`](https://github.com/blepabyte/maxray/commit/802ddb3291ef5d3c5863296a00d0e76f2a061f08))
+
+* feat: composable inators
+
+- support construction from CLI arguments
+- allow extending log capture mechanism
+- remove `call_count` from FnContext ([`6e8991d`](https://github.com/blepabyte/maxray/commit/6e8991dd8bdfb2175df67b9590d43f88fb0698a6))
+
+* feat: `entered` prop and nocompile context ([`9c8c59a`](https://github.com/blepabyte/maxray/commit/9c8c59a1a624fea0a8fadce51811f1775cb0e556))
+
+### Fix
+
+* fix: chained assignment unpacking ([`768b3df`](https://github.com/blepabyte/maxray/commit/768b3df05e87ed6630e761f9921411ec08a88562))
+
+* fix: staticmethod transforms only ran on the first time ([`eae0fe9`](https://github.com/blepabyte/maxray/commit/eae0fe9156f003339c299680a96a010183634e49))
+
+### Refactor
+
+* refactor: NodeContext -&gt; RayContext ([`90ae0ee`](https://github.com/blepabyte/maxray/commit/90ae0ee5ab98f474c391bd662c4b27d2ca04bf9d))
+
+* refactor: replace NodeContext with higher-level Ray interface ([`031fec4`](https://github.com/blepabyte/maxray/commit/031fec442f480893b3a9c2980635aecdad0ed625))
+
+### Unknown
+
+* iter: bind internal context for logging ([`8cc4c96`](https://github.com/blepabyte/maxray/commit/8cc4c96c183791ad94dda283068513cde7850e87))
+
 ## v0.6.0 (2024-09-11)
 
 ### Feature
