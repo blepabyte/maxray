@@ -97,6 +97,20 @@ class RewriteTransformCall(ast.Call):
             keywords=[],
         )
 
+    def map_location(self, f):
+        match self.args[1].args[3]:
+            case (
+                ast.Constant(
+                    value=(line_start, line_end, col_start, col_end)
+                ) as location_node
+            ):
+                location_node.value = tuple(f(line_start, line_end, col_start, col_end))
+
+            case _:
+                raise RuntimeError("Missed NodeContext location")
+
+        return self
+
     def assigned(self, assign_targets: list[str]):
         self.args[1] = ast.Call(
             ast.Attribute(self.args[1], "_set_assigned", ctx=ast.Load()),
@@ -146,6 +160,9 @@ class FnRewriter(ast.NodeTransformer):
         fn_context: FnContext,
         runtime_helper: RewriteRuntimeHelper,
         *,
+        post_build_transform: Optional[
+            Callable[[RewriteTransformCall], RewriteTransformCall]
+        ] = None,
         instance_type: str | None,
         dedent_chars: int = 0,
         pass_locals_to_ctx: bool = False,
@@ -159,7 +176,10 @@ class FnRewriter(ast.NodeTransformer):
         self.fn_context = fn_context
         self.runtime_helper = runtime_helper
         self.instance_type = instance_type
+        self.post_build = post_build_transform or (lambda x: x)
+
         self.dedent_chars = dedent_chars
+
         self.pass_locals_to_ctx = pass_locals_to_ctx
         self.is_maxray_root = is_maxray_root
 
@@ -198,10 +218,14 @@ class FnRewriter(ast.NodeTransformer):
     def recover_source(self, pre_node):
         segment = ast.get_source_segment(self.fn_context.source, pre_node, padded=False)
         if segment is None:
-            logger.warning(f"No source segment for {self.fn_context}")
+            logger.warning(f"No source segment for {self.fn_context} {pre_node}")
             logger.info(self.safe_unparse(pre_node))
             return self.safe_unparse(pre_node)
         return segment
+
+    def generic_visit(self, node: ast.AST) -> ast.AST:
+        # TODO: might want to use a `match` instead of the default implementation
+        return super().generic_visit(node)
 
     def build_transform_node(self, node, label, node_source=None, extra_kwargs=None):
         """
@@ -242,8 +266,10 @@ class FnRewriter(ast.NodeTransformer):
                 )
             )
 
-        return RewriteTransformCall.build(
-            self.transform_fn.__name__, node, context_args, keyword_args
+        return self.post_build(
+            RewriteTransformCall.build(
+                self.transform_fn.__name__, node, context_args, keyword_args
+            )
         )
 
     def visit_Name(self, node):
@@ -511,7 +537,13 @@ class FnRewriter(ast.NodeTransformer):
 
         if is_transform_root:
             # If we didn't clear, decorators would be applied twice - screwing up routing handling in libraries like `quart`: `@app.post("/generate")`
-            node.decorator_list = []
+            for dec in node.decorator_list:
+                match dec:
+                    # though if `xray(...)` is applied post-definition to some existing function (not as a decorator at definition site), existing decorators should be preserved
+                    case ast.Call(func=ast.Name(id="xray" | "maxray")):
+                        node.decorator_list = []
+                        break
+
         else:
             # Handle nested @xray calls (e.g. running via `xpy` - everything inside has already been transformed but there won't be source code)
             for dec in node.decorator_list:
@@ -580,8 +612,22 @@ class BackingDict(dict):
 
         self.backing_layers = backing_layers
 
+    # Doesn't get called?
+    # def keys(self):
+    #     return set.union(super().keys(), *(bl.keys() for bl in self.backing_layers))
+
+    def __contains__(self, key: object, /) -> bool:
+        if super().__contains__(key):
+            return True
+
+        for d in self.backing_layers:
+            if key in d:
+                return True
+
+        return False
+
     def __getitem__(self, key):
-        if key in self:
+        if super().__contains__(key):
             return super().__getitem__(key)
 
         for backing in self.backing_layers:
@@ -596,7 +642,9 @@ def recompile_fn_with_transform(
     source_fn,
     transform_fn,
     ast_pre_callback=None,
-    ast_post_callback=None,
+    post_build_transform: Optional[
+        Callable[[RewriteTransformCall], RewriteTransformCall]
+    ] = None,
     override_scope={},
     pass_scope=False,
     special_use_instance_type=None,
@@ -626,6 +674,12 @@ def recompile_fn_with_transform(
         return with_source_fn.mark_errored(
             f"Non-existent source module `{getattr(source_fn, '__module__', None)}` for function {get_fn_name(source_fn)}"
         )
+
+    # Allow overwriting __file__
+    if "__file__" in override_scope:
+        source_file = override_scope["__file__"]
+    else:
+        source_file = with_source_fn.source_file
 
     # A bit hacky: Handle non-"methods" like NDFrame.isna (unbound, not called from instance)
     if (
@@ -657,7 +711,11 @@ def recompile_fn_with_transform(
             )
 
     if ast_pre_callback is not None:
-        ast_pre_callback(fn_ast)
+        match ast_pre_callback(fn_ast):
+            case None:
+                pass
+            case pre_fn_ast:
+                fn_ast = pre_fn_ast
 
     fn_is_method = with_source_fn.method_info.is_inspect_method
     if fn_is_method:
@@ -684,11 +742,10 @@ def recompile_fn_with_transform(
 
     fn_context = FnContext(
         source_fn,
-        source_fn.__qualname__,
-        module_name,
-        with_source_fn.source,
-        with_source_fn.source_file,
-        with_source_fn.source_offset_lines,
+        name=source_fn.__qualname__,
+        module=module_name,
+        source=with_source_fn.source,
+        source_file=source_file,
         compile_id=with_source_fn.compile_id,
     )
     runtime_helper = RewriteRuntimeHelper(fn_context)
@@ -699,6 +756,7 @@ def recompile_fn_with_transform(
         fn_context,
         runtime_helper,
         instance_type=instance_type,
+        post_build_transform=post_build_transform,
         dedent_chars=with_source_fn.source_dedent_chars,
         pass_locals_to_ctx=pass_scope,
         is_maxray_root=is_maxray_root,
@@ -713,9 +771,6 @@ def recompile_fn_with_transform(
 
     ast.fix_missing_locations(transformed_fn_ast)
 
-    if ast_post_callback is not None:
-        ast_post_callback(transformed_fn_ast)
-
     scope_layers = {
         "core": {
             transform_fn.__name__: transform_fn,
@@ -726,7 +781,6 @@ def recompile_fn_with_transform(
         },
         "override": override_scope,
         "class_local": {},
-        "module": {},
         "closure": {},
     }
 
@@ -761,8 +815,6 @@ def recompile_fn_with_transform(
             )
             return None
 
-    scope_layers["module"].update(vars(module))
-
     if hasattr(source_fn, "__closure__") and source_fn.__closure__ is not None:
         scope_layers["closure"].update(
             {
@@ -780,10 +832,27 @@ def recompile_fn_with_transform(
             **scope_layers["closure"],
             **scope_layers["override"],
         }
+
+        def scope_eval(source, globals=None, locals=None, /):
+            if globals is None:
+                # globals = scope["_MAXRAY_MODULE_GLOBALS"]
+                globals = scope
+            if locals is None:
+                # locals = scope["_MAXRAY_MODULE_GLOBALS"]
+                locals = scope
+            return eval(source, globals, locals)
+
         scope = BackingDict(
             scope,
-            backing_layers=[vars(module), vars(builtins), scope_layers["class_local"]],
+            backing_layers=[
+                vars(module),
+                # default eval picks up wrong "globals"
+                {"eval": scope_eval},
+                vars(builtins),
+                scope_layers["class_local"],
+            ],
         )
+        # TODO: module dict mutation?
 
         if not fn_is_method and source_fn.__name__ in scope:
             logger.warning(
@@ -793,7 +862,7 @@ def recompile_fn_with_transform(
         exec(
             compile(
                 transformed_fn_ast,
-                filename=f"<{source_fn.__name__} in {with_source_fn.source_file}>",
+                filename=f"<maxray:{source_fn.__name__}> in {source_file}",
                 mode="exec",
             ),
             scope,

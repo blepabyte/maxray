@@ -1,5 +1,6 @@
-from maxray.inators.core import S, Ray
+from maxray.inators.core import R, S, Ray
 from maxray.inators.base import BaseInator
+from maxray.inators.display import RemoveElement, UpdateElement
 from maxray.runner import (
     MAIN_FN_NAME,
     RunAborted,
@@ -13,6 +14,7 @@ from maxray.runner import (
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import click
 
@@ -43,8 +45,10 @@ class Show(BaseInator):
         except Exception:
             n = None
 
+        # TODO: support other display backends?
         progress = Progress(auto_refresh=False)
         t1 = progress.add_task(label, total=n)
+        rand_id = str(uuid4())
 
         st = time.perf_counter()
         count = 0
@@ -55,18 +59,21 @@ class Show(BaseInator):
                 count += 1
                 progress.update(t1, advance=1, field_uhh=f"n = {count}")
 
+                # TODO: some repr of current iterate?
+                # prog.update(jerb1, description=f"{el_src} = {inner} ∈ {it_src}")
+
                 n_expected = n if n is not None else 10
                 elapsed = time.perf_counter() - st
                 if (
                     elapsed > 1
                     or elapsed / count * n_expected > self.elapsed_show_threshold
                 ) and not bar_shown:
-                    S.display.elements.insert(0, progress)
+                    R.DisplayChannel.push(UpdateElement(rand_id, progress))
                     bar_shown = True
 
         finally:
             try:
-                S.display.elements.remove(progress)
+                R.DisplayChannel.push(RemoveElement(rand_id))
             except Exception:
                 ...
 

@@ -18,8 +18,6 @@ class FnContext:
     module: str
     source: str
     source_file: str
-    line_offset: int
-    "Line number in `source_file` at which the function definition begins."
 
     compile_id: str
 

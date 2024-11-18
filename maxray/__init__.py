@@ -1,4 +1,5 @@
 from .nodes import NodeContext, RayContext
+from .inators.core import Ray
 from .transforms import recompile_fn_with_transform
 from .function_store import FunctionStore, set_property_on_functionlike
 
@@ -63,6 +64,7 @@ _GLOBAL_SKIP_MODULES = {
     "collections",
     # Libraries that are too weird to correctly patch
     "pytest",
+    "_pytest",
     # Libraries possibly not fully working yet
     "logging",  # global _loggerClass probably causes problems
     "functools",  # partialmethod causes mis-bound `self` in TQDM
@@ -126,8 +128,6 @@ class W_erHook:
     active_call_state: ContextVar[bool]
     writer_active_call_state: ContextVar[bool]
     mutable: bool
-
-    # each walker defines names to skip and we skip recursive transform if *any* walker asks to skip
 
 
 _MAXRAY_REGISTERED_HOOKS: list[W_erHook] = []
@@ -194,7 +194,7 @@ def transform_precheck(x, ctx: NodeContext):
         pass
 
     # __module__: The name of the module the function was defined in, or None if unavailable.
-    if base_module(x) in _GLOBAL_SKIP_MODULES:
+    if base_module(x) in _MAXRAY_TRANSFORM_SETTINGS.forbid_modules:
         return False
 
     # dot suffix so that "re" doesn't match "requests"
@@ -235,7 +235,7 @@ def instance_allowed_for_transform(x, ctx: NodeContext):
         # e.g. loguru: _GeneratorContextManager object is not an iterator (might be a separate bug)
         return False
 
-    if base_module(x) in _GLOBAL_SKIP_MODULES:
+    if base_module(x) in _MAXRAY_TRANSFORM_SETTINGS.forbid_modules:
         return False
 
     # dot suffix so that "re" doesn't match "requests"
@@ -366,7 +366,7 @@ def _maxray_walker_handler(x, ctx: NodeContext):
     # 2. run the active hooks
     global_write_active_token = _GLOBAL_WRITER_ACTIVE_FLAG.set(True)
     try:
-        ray = RayContext(
+        ray = Ray(
             x, ctx, unpack_assignments=not _MAXRAY_TRANSFORM_SETTINGS.preserve_values
         )
         x = ray.value()
@@ -402,6 +402,8 @@ def maxray(
     assume_transformed=False,
     pass_scope=False,
     preserve_values=True,
+    _root_ast_pre_transform=None,
+    _root_build_transform=None,
 ) -> Callable[[T], T]:
     """
     A transform that recursively hooks into all further calls made within the function, so that `writer` will (in theory) observe every single expression evaluated by the Python interpreter occurring as part of the decorated function call.
@@ -445,6 +447,8 @@ def maxray(
                 override_scope=caller_locals,
                 pass_scope=_MAXRAY_TRANSFORM_SETTINGS.pass_local_scopes,
                 is_maxray_root=True,
+                ast_pre_callback=_root_ast_pre_transform,
+                post_build_transform=_root_build_transform,
             ):
                 case Ok(fn_transform):
                     pass

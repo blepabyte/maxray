@@ -14,6 +14,7 @@ import pyarrow.feather as ft
 import sys
 from pathlib import Path
 
+from loguru import logger
 import click
 
 
@@ -22,7 +23,6 @@ import click
 )
 @click.argument("script", type=str)
 @click.option("-W", "--watch", type=str, multiple=True)
-# TODO: -x, --exclude-module
 @click.option("-m", "--module", is_flag=True)
 @click.option(
     "-l",
@@ -37,14 +37,34 @@ import click
     help="Don't apply value transformations (e.g. automatically unpacking assignments to allow matching)",
 )
 @click.option(
-    "--restrict",
+    "--local",
     is_flag=True,
-    help="Don't recursively patch source code, only tracing code in the immediately invoked script file",
+    help="Only patch and trace source code in the immediately invoked script or module (an alias for `-i .`)",
+)
+@click.option(
+    "-i",
+    "--include",
+    type=str,
+    multiple=True,
+    help="By default all functions are recursively patched. If any include flags are manually passed, only functions belonging to included modules are allowed to be patched. Use `-i .` to only include the script/module being run.",
+)
+@click.option(
+    "-x",
+    "--exclude",
+    type=str,
+    multiple=True,
+    help="Forbid modules passed in this list from being patched (in addition to those hard-coded in _GLOBAL_SKIP_MODULES)",
+)
+@click.option(
+    "-q",
+    "--quiet",
+    is_flag=True,
+    help="Disables display and interactive elements.",
 )
 @click.option(
     "--rerun",
     is_flag=True,
-    help="Start a rerun.io viewer (requires `rerun-sdk` to be installed)",
+    help="Use a rerun.io viewer as the display backend (requires `rerun-sdk` to be installed)",
 )
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def cli(
@@ -52,8 +72,11 @@ def cli(
     module: bool,
     watch: tuple,
     loop: bool,
-    restrict: bool,
+    local: bool,
+    include: tuple,
+    exclude: tuple,
     preserve: bool,
+    quiet: bool,
     rerun: bool,
     args,
 ):
@@ -62,35 +85,49 @@ def cli(
 
     if module:
         run = ScriptFromModule(script)
-        run_name = script
     else:
         run = ScriptFromFile(script)
-        run_name = Path(script).name
 
     hooks = []
     if watch:
         for spec in watch:
             hooks.append(ReloadHook(reloadable_from_spec(spec).unwrap()))
 
-        if hooks and rerun:
-            hooks.append(
-                ReloadHook(reloadable_from_spec("maxray.inators.rerun:Setup").unwrap())
+    # Each display backend should enable and redirect logs to their display
+    if not quiet:
+        if rerun:
+            hooks.insert(
+                0,
+                ReloadHook(
+                    reloadable_from_spec("maxray.inators.rerun:Display").unwrap()
+                ),
             )
+        elif hooks:
+            hooks.insert(
+                0,
+                ReloadHook(
+                    reloadable_from_spec("maxray.inators.rich:Display").unwrap()
+                ),
+            )
+
+    if hooks and not quiet:
+        hooks.append(
+            ReloadHook(reloadable_from_spec("maxray.inators.debug:IPDB").unwrap())
+        )
+
+    if local:
+        include = include + (".",)
 
     run_wrapper = ScriptRunner(
         run,
-        restrict_to_source_module=restrict,
+        include_patch_modules=include,
+        exclude_patch_modules=exclude,
         preserve_values=preserve,
     )
 
     as_interactive = len(hooks) > 0 or loop
     if as_interactive:
         run_wrapper = InteractiveRunner(run_wrapper, hooks, loop=loop)
-
-    if rerun:
-        import rerun as rr
-
-        rr.init(f"xpy:{run_name}", spawn=True)
 
     run_result = run_wrapper.run()
 
@@ -117,7 +154,7 @@ def cli(
                 exc_trace,
                 suppress=[sys.modules["maxray"]],
                 show_locals=True,
-                max_frames=5,
+                max_frames=10,
             )
             rich.print(traceback)
             sys.exit(1)

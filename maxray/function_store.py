@@ -134,7 +134,8 @@ class FunctionData:
         dedent_chars = None
         try:
             # inspect.getsource literally calls getsourcelines and joins
-            original_source_lines, line_offset = inspect.getsourcelines(fn)
+            original_source_lines, _line_number = inspect.getsourcelines(fn)
+            line_offset = _line_number - 1  # 1-indexed -> 0-indexed so that a file
             original_source = "".join(original_source_lines)
             # nested functions have excess indentation preventing compile; inspect.cleandoc(source) is an alternative but less reliable
             source = textwrap.dedent(original_source)

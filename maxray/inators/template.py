@@ -105,8 +105,7 @@ class Inator(BaseInator):
             case RunCompleted():
                 ...
             case RunErrored():
-                with S.display.hidden():
+                with self.hide_display():
                     result.show_traceback()
-                    S.enter_debugger(post_mortem=result.traceback)
 
         self.wait_and_reload()

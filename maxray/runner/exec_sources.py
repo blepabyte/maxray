@@ -18,7 +18,12 @@ class ScriptFile:
     path: Path
 
     def evaluated(self):
-        return vars(importfile(str(self.path)))
+        prev_sys_path = [*sys.path]
+        sys.path.append(str(self.path.parent.resolve(True)))
+        try:
+            return vars(importfile(str(self.path)))
+        finally:
+            sys.path = prev_sys_path
 
 
 @dataclass
@@ -121,14 +126,14 @@ def reloadable_from_spec(
 
     try:
         module_spec = importlib.util.find_spec(spec_source)
-    except ModuleNotFoundError:
+    except (ModuleNotFoundError, ImportError):
         module_spec = None
     if module_spec is None:
         try:
             # Shortcut for included inators
             module_spec = importlib.util.find_spec(f"maxray.inators.{spec_source}")
             spec_source = f"maxray.inators.{spec_source}"
-        except ModuleNotFoundError:
+        except (ModuleNotFoundError, ImportError):
             pass
 
     if module_spec is not None and module_spec.origin is not None:

@@ -52,7 +52,6 @@ def test_pytorch_ops():
     assert check_cmp() is True
 
 
-@pytest.mark.xfail
 @if_package("torch")
 def test_pytorch_nograd_context():
     import torch

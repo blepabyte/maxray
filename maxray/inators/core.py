@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 from maxray.nodes import NodeContext, RayContext
-from .display import Display
-
-import ipdb
+from maxray.function_store import FunctionStore
 
 from contextvars import ContextVar
 from dataclasses import dataclass
 import inspect
 from functools import partial
 from contextlib import contextmanager
-from types import TracebackType
 from typing import Any, Callable, Generator, Iterator
 
 from loguru import logger
+
+
+MAIN_FN_NAME = "maaaaaaain"
 
 
 class Statefool:
@@ -50,20 +50,6 @@ class Statefool:
 
         self._existing_keys[key] = (v, new_o := factory(ex_o))
         return new_o
-
-    @property
-    def display(self):
-        return self.define_once("RICH_LIVE_DISPLAY", lambda _: Display())
-
-    def enter_debugger(self, post_mortem: TracebackType | bool = False):
-        with self.display.hidden():
-            if post_mortem is True:
-                # Needs to be an active exception
-                ipdb.post_mortem()
-            elif isinstance(post_mortem, TracebackType):
-                ipdb.post_mortem(post_mortem)
-            else:
-                ipdb.set_trace()
 
 
 class IterScope:
@@ -148,6 +134,7 @@ class IterScope:
             except Exception as e:
                 self.completed = True
                 self.status = self.Errored(e, e.__traceback__)
+                logger.error(f"{e}")
             # Check that the generator must have advanced
         return x
 
@@ -245,9 +232,7 @@ class Rewriter:
 
 class Ray(RayContext):
     """
-    Captures the state of a point (syntax node) in the source code of the original program.
-
-    One instance is created for each point in the program, that is then passed to multiple handlers.
+    Extends RayContext for interactive use
     """
 
     def log(self, msg: str, *, level="INFO"):
@@ -271,6 +256,13 @@ class Ray(RayContext):
         This preserves access to a view of locals() in the `with` block.
         """
         return iter_namespace.stack(partial(iter_fn, self))
+
+    def line_at_endpoint(self):
+        line_anchor_point = (
+            self.ctx.location[1]
+            - FunctionStore.get(self.ctx.fn_context.compile_id).data.source_offset_lines
+        )
+        return self.ctx.fn_context.source.splitlines()[line_anchor_point]
 
 
 R = Rewriter()

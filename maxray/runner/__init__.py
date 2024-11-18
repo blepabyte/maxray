@@ -6,7 +6,7 @@ from .exec_sources import (
 from maxray import maxray
 from maxray.nodes import NodeContext, FnContext, RayContext
 from maxray.function_store import FunctionStore
-from maxray.inators.core import Ray
+from maxray.inators.core import Ray, MAIN_FN_NAME
 
 import pyarrow.compute as pc
 import watchfiles
@@ -27,9 +27,6 @@ from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType, TracebackType
-
-
-MAIN_FN_NAME = "maaaaaaain"
 
 
 # Pauses execution
@@ -57,12 +54,6 @@ def empty_module(module_name: str):
     exec(module_code_object, module.__dict__)
 
     return module
-
-
-def set_event():
-    event = threading.Event()
-    event.set()
-    return event
 
 
 def watch_files(file_paths):
@@ -99,7 +90,7 @@ def watch_files(file_paths):
 @dataclass
 class ReloadHook:
     watched: ReloadableFunction | ReloadableInstance
-    needs_reload: threading.Event = field(default_factory=set_event)
+    needs_reload: threading.Event = field(default_factory=threading.Event)
 
     def wait_for_update(self):
         self.needs_reload.clear()
@@ -205,8 +196,14 @@ class ScriptFromString:
 
 @dataclass
 class ExecInfo:
-    source_origin: Optional[Path]
+    _source_origin: Optional[Path]
     temp_exec_file: Path
+    # source_hash
+
+    @property
+    def source_origin(self) -> Path:
+        assert self._source_origin is not None
+        return self._source_origin
 
 
 @dataclass
@@ -233,7 +230,7 @@ class RunErrored:
             exc_trace,
             suppress=[sys.modules["maxray"]],
             show_locals=True,
-            max_frames=5,
+            max_frames=10,
         )
         rich.print(traceback)
 
@@ -247,13 +244,14 @@ class RunAborted:
 @dataclass
 class ScriptRunner:
     """
-    Supports programmatically running Python scripts and modules in a __main__ context with specified maxray transforms applied.
+    Programmatically runs Python scripts and modules in a `__main__` context with specified maxray transforms applied.
     """
 
     # TODO: remove default args and document
     run_type: ScriptFromFile | ScriptFromString | ScriptFromModule
     with_decor_inator: Callable = lambda x, ray: x
-    restrict_to_source_module: bool = False
+    include_patch_modules: tuple = ()
+    exclude_patch_modules: tuple = ()
     temp_sourcefile: Any = field(
         default_factory=lambda: tempfile.NamedTemporaryFile("w", delete=False)
     )
@@ -276,23 +274,23 @@ class ScriptRunner:
         # HACK: stupid hack (since everything gets wrapped in a function, globals become nonlocals)
         # TODO: support passing AST mods to transform
         # BUG: won't show up in `globals()`
+        # Ideally we'd want to preprocess via AST transform but that would break source location mapping
         source = source.replace("global ", "nonlocal ")
 
         new_source = f"""def {MAIN_FN_NAME}():
 {indent(source, '    ')}
-    # return locals()
 """
 
         # inspect.getsource relies on the file actually existing
         with open(self.temp_sourcefile.name, "w") as f:
             f.write(new_source)
 
-        tree = ast.parse(new_source, filename=self.temp_sourcefile.name)
-        main_func = ast.fix_missing_locations(tree)
+        main_func_tree = ast.parse(new_source, filename=self.temp_sourcefile.name)
+        main_func_tree = ast.fix_missing_locations(main_func_tree)
 
         # BUG: will error if `import *` is used (doesn't work inside a fn `def`)
         compiled_code = compile(
-            main_func,
+            main_func_tree,
             filename=self.temp_sourcefile.name,
             mode="exec",
         )
@@ -318,24 +316,46 @@ class ScriptRunner:
             "__file__": str(self.run_type.sourcemap_to()),
         }
 
+        if self.include_patch_modules:
+            restrict_modules = (
+                frozenset(self.include_patch_modules)
+                .difference({"."})
+                .union(self.run_type.in_module().__name__)
+            )
+        else:
+            restrict_modules = None
+
         # Try to evaluate source (e.g. could fail with SyntaxError)
         try:
             fn = maxray(
                 self.rewrite_node,
                 pass_scope=True,
-                restrict_modules=(
-                    [self.run_type.in_module().__name__]
-                    if self.restrict_to_source_module
-                    else None
-                ),
+                restrict_modules=restrict_modules,
+                forbid_modules=frozenset(self.exclude_patch_modules),
                 initial_scope=push_main_scope,
                 preserve_values=self.preserve_values,
+                # Correct line and column offsets for the inserted main definition
+                # Previously we'd just hackily manually subtract 1/4 from line and column offsets on attempting to detect the `maaa..in` function
+                # Cannot be an AST pre-transform as `recover_source` relies on an accurate mapping to the written temp source file
+                # Can't be an AST post-transform either because NodeContext definitions are created during AST traversal
+                # TODO: investigate not having to rely on Python's builtin source info (which hits the filesystem)
+                _root_build_transform=lambda rtc: rtc.map_location(
+                    lambda line_start, line_end, col_start, col_end: (
+                        line_start - 1,
+                        line_end - 1,
+                        col_start - 4,
+                        col_end - 4,
+                    )
+                ),
             )(self.compile_to_callable())
         except KeyboardInterrupt as e:
             return RunAborted("Signal interrupt", e)
         except BaseException as e:
             sys.path = prev_sys_path
-            return RunAborted(f"Parse/eval of source {self.run_type} failed", e)
+            return RunAborted(f"Parse/eval of source {self.run_type} failed ({e})", e)
+
+        FunctionStore.get(fn._MAXRAY_TRANSFORM_ID).data.source_offset_lines = -1
+        FunctionStore.get(fn._MAXRAY_TRANSFORM_ID).data.source_dedent_chars = -4
 
         # HACKY exception logic
         # click gives us no choice because it *insists* on stealing KeyboardInterrupt even in standalone mode and throwing SystemExit
@@ -382,7 +402,6 @@ class ScriptRunner:
                         "maxray.runner",
                         "",
                         "",
-                        0,
                         compile_id="00000000-0000-0000-0000-000000000000",
                     ),
                     (0, 0, 0, 0),
@@ -392,29 +411,7 @@ class ScriptRunner:
         return status
 
     def rewrite_node(self, x, ray: RayContext):
-        ctx = ray.ctx
-        if ctx.fn_context.source_file == self.temp_sourcefile.name:
-            # copy if needed to prevent mutation
-
-            ctx = copy(ctx)
-            ctx.fn_context = copy(
-                ctx.fn_context
-            )  # functions and contextvars can't be deepcopied
-
-            ctx.fn_context.source_file = str(self.run_type.sourcemap_to())
-
-            # subtract the "def" line and new indentation
-            ctx.location = (
-                ctx.location[0] - 1,
-                ctx.location[1] - 1,
-                ctx.location[2] - 4,
-                ctx.location[3] - 4,
-            )
-
-        ray.ctx = ctx
-        x = self.with_decor_inator(x, ray)
-
-        return x
+        return self.with_decor_inator(x, ray)
 
 
 class InteractiveRunner:
@@ -439,9 +436,6 @@ class InteractiveRunner:
     def default_runner(self):
         while True:
             result = yield
-            time.sleep(
-                1
-            )  # Briefly show display to avoid confusion over wtf is going on
 
             match result:
                 case RunAborted(exception=RestartRun()):
@@ -490,6 +484,7 @@ class InteractiveRunner:
                     continue
 
                 while True:
+                    # TODO: is this really necessary?
                     for hook in self.watch_hooks:
                         hook.require_reload()
 

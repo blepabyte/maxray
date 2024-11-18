@@ -2,23 +2,60 @@ from maxray.inators.core import S, Ray
 from maxray.inators.base import BaseInator
 from maxray.runner import RunCompleted, RunErrored
 from maxray.reprs import structured_repr
+from maxray.function_store import FunctionStore
 
+from result import Result, Ok, Err
 import time
 from uuid import uuid4
 
 import rerun as rr
 
 
-def value_repr(x):
-    if isinstance(x, (str, int, float, bool, type)):
-        return str(x)
-    # TODO
-    if isinstance(x, list):
-        contents = (value_repr(item) for item in x[:3])
-        return "[" + ", ".join(contents) + "]"
-    if x is None:
-        return "None"
-    return "¿¿¿"
+def build_source_block(x, ray: Ray) -> Result:
+    fn_context = ray.ctx.fn_context
+
+    # TODO: can cache this lookup
+    source_offset_lines = FunctionStore.get(
+        fn_context.compile_id
+    ).data.source_offset_lines
+
+    if source_offset_lines is None:
+        return Err("missing source_offset_lines")
+
+    function_lines = fn_context.source.splitlines()
+
+    output_lines = [
+        f"{fn_context.module}",
+        f"{fn_context.source_file}",
+    ]
+    output_lines.append("```python")
+
+    up_to_including_active_line = ray.ctx.location[1] - source_offset_lines
+    output_lines.extend(function_lines[: up_to_including_active_line + 1])
+    num_hash_pads = len(output_lines[-1]) + 3
+    output_lines[-1] += f"  # <-- 💥 u are here ({ray.ctx.source})"
+    output_lines.append("#" * num_hash_pads)
+    output_lines.append("```\n")
+
+    output_lines.append("```")
+
+    # Attempt at avoiding repr of incompletely initialised objects
+    if "__init__" not in fn_context.name:
+        try:
+            x_repr = repr(x)
+        except Exception as e:
+            x_repr = f"! unrepresentable: {e}"
+    else:
+        x_repr = f"{type(x).__name__} @ {id(x)}"
+
+    output_lines.append(x_repr)
+    output_lines.append("```\n")
+
+    output_lines.append("```python")
+    output_lines.extend(function_lines[up_to_including_active_line + 1 :])
+    output_lines.append("```")
+
+    return Ok("\n".join(output_lines))
 
 
 class Source(BaseInator):
@@ -28,8 +65,6 @@ class Source(BaseInator):
         self.current_function_logs = []
 
     def xray(self, x, ray: Ray):
-        ctx = ray.ctx
-
         S.define_once(
             "RERUN_INSTANCE",
             lambda _: rr.init(f"{self}", spawn=True, recording_id=str(uuid4())),
@@ -39,54 +74,18 @@ class Source(BaseInator):
         if isinstance(x, (RunCompleted, RunErrored)):
             return
 
-        # if isinstance(x, str):
-        #     rr.log("strings", rr.TextLog(x))
-
-        fn_source = ctx.fn_context.source
-
-        fn_lines = fn_source.splitlines()
-
-        try:
-            expr_line = ctx.location[0] - ctx.fn_context.line_offset + 1
-            fn_lines[expr_line] = f"{fn_lines[expr_line]}"
-            expr_repr = (
-                f"```\n{ctx.source}: {structured_repr(x)} = {value_repr(x)}\n```"
-            )
-
-            repr_pre = "\n".join(fn_lines[:expr_line])
-            repr_post = "\n".join(fn_lines[expr_line + 1 :])
-            repr_state = f"""
-```
-{ctx.fn_context.name} in module {ctx.fn_context.module}
-{ctx.fn_context.source_file}
-```
-
-```python
-{repr_pre}
-```
----
-
-{expr_repr}
-
-```python
-{fn_lines[expr_line]}
-```
-
----
-
-```python
-{repr_post}
-```
-"""
-        except Exception as e:
-            rr.log(
-                "LiveGrep:internal",
-                rr.TextLog(
-                    f"{e}: {type(e).__qualname__}", level=rr.TextLogLevel("ERROR")
-                ),
-            )
-            return
-
-        rr.log(
-            "current_function", rr.TextDocument(repr_state, media_type="text/markdown")
-        )
+        match build_source_block(x, ray):
+            case Ok(annotated_function_source):
+                markdown_blocks = f"""{annotated_function_source}"""
+                rr.log(
+                    "current_function",
+                    rr.TextDocument(markdown_blocks, media_type="text/markdown"),
+                )
+            case Err(e):
+                rr.log(
+                    "current_function",
+                    rr.TextDocument(
+                        f"{e}: Err building function source representation",
+                        media_type="text/markdown",
+                    ),
+                )

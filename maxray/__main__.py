@@ -92,6 +92,11 @@ class Builder(ast.NodeTransformer):
     is_flag=True,
     help="A restricted version of `runner` that is just a contextmanager entered for the lifetime of the program. Useful for cleanup or displaying/saving results",
 )
+@click.option(
+    "--all",
+    is_flag=True,
+    help="Enable all features"
+)
 @click.option("--name", type=str, default="Inator", help="Name of the class to create")
 def template(
     path: Path,
@@ -101,8 +106,14 @@ def template(
     runner: bool,
     rerun: bool,
     session: bool,
+    all: bool,
     name: str,
 ):
+    cli = all or cli
+    runner = all or runner
+    rerun = all or rerun
+    session = all or session
+    
     save_path = path.resolve(False)
 
     if create_mode == "over":
