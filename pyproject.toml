@@ -12,9 +12,9 @@ Tracker = "https://github.com/blepabyte/maxray/issues"
 
 [tool.poetry.dependencies]
 python = "^3.11"
-result = "^0.16.1"
-loguru = "^0.7.2"
-pyarrow = "^18.0.0"
+result = ">=0.17.0"
+loguru = ">=0.7.2"
+pyarrow = ">=18.0.0"
 watchfiles = "^0.24.0"
 click = "^8.1.7"
 rich = "^13.7.1"

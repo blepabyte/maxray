@@ -1,6 +1,6 @@
 from maxray.nodes import NodeContext
 from maxray.inators.core import R, S, Ray
-from maxray.inators.display import SetVisible, SetStatus, DumpTraceback
+from maxray.inators.display import SetVisible, SetStatus, DumpTraceback, ShowValue
 from maxray.runner import ExecInfo, RunCompleted, RunErrored, RunAborted, Break
 
 from contextlib import contextmanager
@@ -79,3 +79,6 @@ class BaseInator:
             yield
         finally:
             R.DisplayChannel.push(SetVisible(True))
+
+    def show(self, value):
+        R.DisplayChannel.push(ShowValue(value))

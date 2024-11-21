@@ -11,6 +11,7 @@ from . import (
 )
 import pyarrow.feather as ft
 
+from importlib.util import find_spec
 import sys
 from pathlib import Path
 
@@ -61,11 +62,6 @@ import click
     is_flag=True,
     help="Disables display and interactive elements.",
 )
-@click.option(
-    "--rerun",
-    is_flag=True,
-    help="Use a rerun.io viewer as the display backend (requires `rerun-sdk` to be installed)",
-)
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def cli(
     script: str,
@@ -77,7 +73,6 @@ def cli(
     exclude: tuple,
     preserve: bool,
     quiet: bool,
-    rerun: bool,
     args,
 ):
     # Reset sys.argv so client scripts don't try to parse our arguments
@@ -88,32 +83,26 @@ def cli(
     else:
         run = ScriptFromFile(script)
 
+    has_display = False
+
     hooks = []
     if watch:
         for spec in watch:
-            hooks.append(ReloadHook(reloadable_from_spec(spec).unwrap()))
+            hooks.append(ReloadHook(reloadable := reloadable_from_spec(spec).unwrap()))
+            has_display = has_display or reloadable.name == "Display"
 
     # Each display backend should enable and redirect logs to their display
-    if not quiet:
-        if rerun:
-            hooks.insert(
-                0,
-                ReloadHook(
-                    reloadable_from_spec("maxray.inators.rerun:Display").unwrap()
-                ),
-            )
-        elif hooks:
-            hooks.insert(
-                0,
-                ReloadHook(
-                    reloadable_from_spec("maxray.inators.rich:Display").unwrap()
-                ),
-            )
+    if not quiet and not has_display:
+        hooks.insert(
+            0,
+            ReloadHook(reloadable_from_spec("maxray.inators.rich:Display").unwrap()),
+        )
 
     if hooks and not quiet:
-        hooks.append(
-            ReloadHook(reloadable_from_spec("maxray.inators.debug:IPDB").unwrap())
-        )
+        if find_spec("ipdb") is not None:
+            hooks.append(
+                ReloadHook(reloadable_from_spec("maxray.inators.debug:IPDB").unwrap())
+            )
 
     if local:
         include = include + (".",)

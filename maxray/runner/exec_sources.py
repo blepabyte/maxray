@@ -13,6 +13,43 @@ from pathlib import Path
 from typing import Optional, Any, Callable
 
 
+def extract_toplevel_imports(source: str) -> tuple[list[str], str]:
+    """
+    It's almost always OK to take the entire source of a script and indent + wrap it in a function definition, with the 2 following exceptions that must be placed at top level:
+    - `from mod import *`
+    - `from __future__ import ...`
+
+    This replaces the lines containing those statements with blank lines, so that exact source locations can be preserved and mapped. Those imports are also returned, so they can be hoisted to the top of the file (and line numbers can be offset in the rest of the file to compensate).
+    """
+
+    tree = ast.parse(source)
+    lines = source.splitlines()
+
+    star_imports = []
+    star_import_lines = []
+
+    # Find all star imports
+    for node in ast.walk(tree):
+        match node:
+            case (
+                ast.ImportFrom(names=[ast.alias(name="*")])
+                | ast.ImportFrom(module="__future__")
+            ):
+                line_no = node.lineno - 1  # AST line numbers are 1-based
+                star_imports.append(lines[line_no])
+                star_import_lines.append(line_no)
+
+    # Replace star import lines with blank lines
+    for line_no in star_import_lines:
+        lines[line_no] = ""
+
+    # Reconstruct the source
+    modified_source = "\n".join(lines)
+
+    star_imports.sort(key=lambda line: "__future__" in line, reverse=True)
+    return star_imports, modified_source
+
+
 @dataclass
 class ScriptFile:
     path: Path
@@ -71,6 +108,10 @@ class ReloadableFunction:
     def call(self, x, ray):
         return self.function(x, ray)
 
+    @property
+    def name(self):
+        return self.function_name
+
 
 @dataclass
 class ReloadableInstance:
@@ -94,10 +135,24 @@ class ReloadableInstance:
     def call(self, x, ray):
         return self.instance(x, ray)
 
+    @property
+    def name(self):
+        return self.type_name
+
 
 def reloadable_from_spec(
     spec: str,
 ) -> Result[ReloadableFunction | ReloadableInstance, str]:
+    """
+    A `spec` string identifies some Python code somewhere to execute and load into the current session.
+
+    Supported formats are:
+
+    - `lambda x, ray: x`  -- raw source code evaluating a lambda expression
+    - `./scripts/somefile.py:function_name` -- looks for `function_name` in the script's scope after evaluating `somefile.py`)
+    - `your_package.some_submodule:InstanceName` -- looks for `InstanceName` (i.e. a class definition) after evaluating the (sub)module; this can be from any locally installed Python package
+    """
+
     if spec.startswith("lambda "):  # Cannot be reloaded
         source = CodeString(spec)
         try:
@@ -123,6 +178,10 @@ def reloadable_from_spec(
             return Err(f"Missing symbol specification: {spec}")
 
     depends_on_paths = []
+
+    # Convenience override for these two packages to refer to the respective display backend
+    if spec_source in {"rerun", "rich"}:
+        spec_source = f"maxray.inators.{spec_source}"
 
     try:
         module_spec = importlib.util.find_spec(spec_source)

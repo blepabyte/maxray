@@ -37,6 +37,7 @@ class CaptureLogs(BaseInator):
     """
 
     def __init__(self, flush_every_records: int, flush_every_seconds: float):
+        super().__init__()
         self.flush_every_records = flush_every_records
         self.flush_every_seconds = flush_every_seconds
 

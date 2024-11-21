@@ -4,6 +4,7 @@ from .display import (
     DumpTraceback,
     SetStatus,
     SetVisible,
+    ShowValue,
     UpdateElement,
     UpdateStructElement,
     RemoveElement,
@@ -88,8 +89,6 @@ class Display(BaseInator):
     def __init__(self, update_ms: float):
         super().__init__()
 
-        S.define_once("XPY_DISPLAY_BACKEND", lambda _: self)
-
         self.live = Live(
             Pretty("Waiting for data to show..."), screen=True, auto_refresh=False
         )
@@ -110,11 +109,12 @@ class Display(BaseInator):
     def cli(interval: float):
         return Display(update_ms=interval)
 
-    def iter_messages(
+    def iter_display_messages(
         self,
         messages: Iterator[
             SetVisible
             | SetStatus
+            | ShowValue
             | DumpTraceback
             | UpdateElement
             | UpdateStructElement
@@ -129,6 +129,10 @@ class Display(BaseInator):
 
                 case SetVisible(visible=False):
                     self.live.stop()
+
+                case ShowValue(value=value):
+                    self.elements["show_value"] = Pretty(value)
+                    self.render()
 
                 case SetStatus(text=text):
                     if text != self.status_text:
@@ -186,6 +190,7 @@ class Display(BaseInator):
         log_level = msg.record["level"].name
 
         self.last_log_messages.append(f"{log_level}: {msg}")
+        self.render()
 
     @contextmanager
     def enter_session(self, xi: ExecInfo):
@@ -202,7 +207,7 @@ class Display(BaseInator):
         try:
             with (
                 super().enter_session(xi),
-                R.DisplayChannel.stack(self.iter_messages),
+                R.DisplayChannel.stack(self.iter_display_messages),
             ):
                 yield
         finally:

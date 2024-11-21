@@ -2,6 +2,7 @@ from .exec_sources import (
     ReloadableFunction,
     ReloadableInstance,
     reloadable_from_spec,
+    extract_toplevel_imports,
 )
 from maxray import maxray
 from maxray.nodes import NodeContext, FnContext, RayContext
@@ -277,9 +278,15 @@ class ScriptRunner:
         # Ideally we'd want to preprocess via AST transform but that would break source location mapping
         source = source.replace("global ", "nonlocal ")
 
-        new_source = f"""def {MAIN_FN_NAME}():
-{indent(source, '    ')}
-"""
+        star_imports, rest_of_source = extract_toplevel_imports(source)
+
+        new_source_components = [
+            *star_imports,
+            f"def {MAIN_FN_NAME}():",
+            indent(rest_of_source, "    "),
+        ]
+
+        new_source = "\n".join(new_source_components)
 
         # inspect.getsource relies on the file actually existing
         with open(self.temp_sourcefile.name, "w") as f:
@@ -304,7 +311,7 @@ class ScriptRunner:
 
         sys.modules[exec_in_module.__name__] = exec_in_module
         main.__module__ = exec_in_module.__name__
-        return main
+        return (main, len(star_imports))
 
     def run(self) -> RunCompleted | RunErrored | RunAborted:
         # Fixes same-directory imports (as the actual script is in some random temp dir)
@@ -327,6 +334,8 @@ class ScriptRunner:
 
         # Try to evaluate source (e.g. could fail with SyntaxError)
         try:
+            compiled_callable, add_line_offset = self.compile_to_callable()
+
             fn = maxray(
                 self.rewrite_node,
                 pass_scope=True,
@@ -341,13 +350,13 @@ class ScriptRunner:
                 # TODO: investigate not having to rely on Python's builtin source info (which hits the filesystem)
                 _root_build_transform=lambda rtc: rtc.map_location(
                     lambda line_start, line_end, col_start, col_end: (
-                        line_start - 1,
-                        line_end - 1,
+                        line_start - 1 - add_line_offset,
+                        line_end - 1 - add_line_offset,
                         col_start - 4,
                         col_end - 4,
                     )
                 ),
-            )(self.compile_to_callable())
+            )(compiled_callable)
         except KeyboardInterrupt as e:
             return RunAborted("Signal interrupt", e)
         except BaseException as e:

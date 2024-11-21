@@ -25,6 +25,12 @@ class DumpTraceback:
 
 
 @dataclass
+class ShowValue:
+    value: Any
+    label: str = "show"
+
+
+@dataclass
 class UpdateElement:
     id: str
     contents: Any
