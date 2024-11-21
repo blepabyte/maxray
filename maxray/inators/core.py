@@ -268,3 +268,25 @@ class Ray(RayContext):
 R = Rewriter()
 
 S = Statefool()
+
+_TYPE_PERSIST = {}
+
+
+def persist_type(cls):
+    """
+    Because each reload completely redefines all classes that were defined inline, isinstance checks will be broken, and method definition updates won't propagate.
+    """
+    # TODO: could this be auto-patched?
+
+    if cls.__qualname__ in _TYPE_PERSIST:
+        merge_cls = _TYPE_PERSIST[cls.__qualname__]
+        # TypeError: __class__ assignment only supported for mutable types or ModuleType subclasses
+        # merge_cls.__class__ = cls
+
+        merge_cls.__bases__ = (cls,)
+        return merge_cls
+    else:
+        wrap_cls = type(cls.__name__, (cls,), {})
+        wrap_cls.__qualname__ = cls.__qualname__
+        _TYPE_PERSIST[cls.__qualname__] = wrap_cls
+        return wrap_cls

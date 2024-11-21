@@ -1,4 +1,7 @@
-from maxray.inators.core import IterScope
+from maxray.inators.core import IterScope, persist_type
+
+from dataclasses import dataclass
+
 import pytest
 
 
@@ -137,3 +140,35 @@ def test_internal_interrupted():
             assert True
         case _:
             assert False, ih.result()
+
+
+def test_type_identity_on_reload():
+    @persist_type
+    @dataclass(frozen=True)
+    class Foo:
+        x: int
+
+        def oof(self):
+            return 1 + self.x
+
+    qn1 = Foo.__qualname__
+    i1 = Foo(2)
+    assert i1.oof() == 3
+
+    @persist_type
+    @dataclass(frozen=True)
+    class Foo:
+        x: int
+
+        def oof(self):
+            return 2 + self.x
+
+    qn2 = Foo.__qualname__
+    i2 = Foo(2)
+
+    assert qn1 == qn2
+    assert i1 == i2
+    assert type(i1) is type(i2)
+    assert i1.oof() == i2.oof() == 4
+    assert i1 in {i2}
+    assert i2 in {i1}
